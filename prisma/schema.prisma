@@ -1,0 +1,524 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum UserRole {
+  ADMIN
+  CUSTOMER
+}
+
+enum AppointmentStatus {
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum ExtraServiceRequestStatus {
+  PENDING
+  QUOTED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+}
+
+enum AddressType {
+  RESIDENTIAL
+  COMMERCIAL
+  OTHER
+}
+
+enum ScheduleBlockType {
+  FULL_DAY
+  TIME_RANGE
+}
+
+enum DayOfWeek {
+  SUNDAY
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+}
+
+enum SearchType {
+  CURRENT_LOCATION
+  MANUAL_ADDRESS
+}
+
+enum NotificationType {
+  APPOINTMENT_RESCHEDULED
+  APPOINTMENT_CANCELLED
+  APPOINTMENT_STARTED
+  GENERAL
+}
+
+model Business {
+  id                    String            @id @default(cuid())
+  name                  String
+  slug                  String            @unique
+  timezone              String            @default("America/Sao_Paulo")
+  isActive              Boolean           @default(true)
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  branding              BusinessBranding?
+  settings              BusinessSettings?
+  businessAddress       BusinessAddress?
+  users                 User[]
+  customers             CustomerProfile[]
+  vehicleTypes          VehicleType[]
+  serviceModes          ServiceMode[]
+  appointments          Appointment[]
+  scheduleBlocks        ScheduleBlock[]
+  extraServices         ExtraService[]
+  extraServiceRequests  ExtraServiceRequest[]
+  addresses             Address[]
+  notifications         Notification[]
+  pushSubscriptions     PushSubscription[]
+
+  @@index([isActive])
+  @@index([createdAt])
+}
+
+model BusinessBranding {
+  id                    String            @id @default(cuid())
+  businessId            String            @unique
+  logoUrl               String?
+  iconUrl               String?
+  primaryColor          String            @default("#0066CC")
+  secondaryColor        String            @default("#FF6B35")
+  accentColor           String            @default("#00D4FF")
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+}
+
+model BusinessAddress {
+  id                    String            @id @default(cuid())
+  businessId            String            @unique
+  
+  streetAddress         String
+  number                String
+  complement            String?
+  neighborhood          String
+  city                  String
+  state                 String
+  zipCode               String
+  country               String            @default("BR")
+  
+  latitude              Decimal           @db.Decimal(10, 8)
+  longitude             Decimal           @db.Decimal(11, 8)
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+}
+
+model BusinessSettings {
+  id                    String            @id @default(cuid())
+  businessId            String            @unique
+  
+  operatingHours        Json              @default("{}")
+  nonOperatingDates     Json              @default("[]")
+  
+  searchFeeUpTo5km      Int               @default(500)
+  searchFeeOver5km      Int               @default(1000)
+  searchFeeLimitKm      Decimal           @db.Decimal(5, 2) @default("5.00")
+  
+  minimumAdvanceMinutes Int               @default(15)
+  
+  whatsappPhone         String?
+  
+  cancellationDeadlineHours Int           @default(24)
+  reschedulingDeadlineHours Int           @default(24)
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+}
+
+model User {
+  id                    String            @id @default(cuid())
+  email                 String
+  passwordHash          String
+  role                  UserRole
+  businessId            String
+  isActive              Boolean           @default(true)
+  lastLoginAt           DateTime?
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  adminProfile          AdminProfile?
+  customerProfile       CustomerProfile?
+  refreshTokens         RefreshToken[]
+  appointments          Appointment[]     @relation("createdByUser")
+  appointmentsModified  Appointment[]     @relation("modifiedByAdmin")
+  notifications         Notification[]
+  pushSubscriptions     PushSubscription[]
+
+  @@unique([email, businessId])
+  @@index([businessId])
+  @@index([email])
+  @@index([role])
+}
+
+model AdminProfile {
+  id                    String            @id @default(cuid())
+  userId                String            @unique
+  name                  String
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model CustomerProfile {
+  id                    String            @id @default(cuid())
+  userId                String            @unique
+  businessId            String
+  name                  String
+  phone                 String
+  documentNumber        String?
+  preferredContactMethod String           @default("WHATSAPP")
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  addresses             Address[]
+  appointments          Appointment[]
+  extraServiceRequests  ExtraServiceRequest[]
+  
+  @@index([businessId])
+  @@index([phone])
+}
+
+model RefreshToken {
+  id                    String            @id @default(cuid())
+  userId                String
+  token                 String
+  expiresAt             DateTime
+  isRevoked             Boolean           @default(false)
+  
+  createdAt             DateTime          @default(now())
+
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model VehicleType {
+  id                    String            @id @default(cuid())
+  businessId            String
+  kind                  String
+  displayName           String
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  rules                 ServiceModeRule[]
+
+  @@unique([businessId, kind])
+  @@index([businessId])
+}
+
+model ServiceMode {
+  id                    String            @id @default(cuid())
+  businessId            String
+  name                  String
+  description           String?
+  isActive              Boolean           @default(true)
+  displayOrder          Int               @default(0)
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  rules                 ServiceModeRule[]
+  appointments          Appointment[]
+  extraServices         ExtraService[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@index([isActive])
+}
+
+model ServiceModeRule {
+  id                    String            @id @default(cuid())
+  serviceModeId         String
+  vehicleTypeId         String
+  
+  durationMinutes       Int
+  basePriceInCents      Int
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  serviceMode           ServiceMode       @relation(fields: [serviceModeId], references: [id], onDelete: Cascade)
+  vehicleType           VehicleType       @relation(fields: [vehicleTypeId], references: [id], onDelete: Cascade)
+  appointments          Appointment[]
+
+  @@unique([serviceModeId, vehicleTypeId])
+  @@index([serviceModeId])
+  @@index([vehicleTypeId])
+}
+
+model Appointment {
+  id                    String            @id @default(cuid())
+  businessId            String
+  customerId            String
+  serviceModeId         String
+  vehicleType           String
+  status                AppointmentStatus @default(CONFIRMED)
+  
+  scheduledStartAt      DateTime
+  scheduledEndAt        DateTime
+  
+  snapshotServiceModeName String
+  snapshotDurationMinutes Int
+  snapshotBasePriceInCents Int
+  snapshotTotalPriceInCents Int
+  
+  willSearchVehicle     Boolean           @default(false)
+  searchType            SearchType?
+  snapshotSearchFeeInCents Int            @default(0)
+  snapshotDistanceKm    Decimal?          @db.Decimal(10, 2)
+  
+  snapshotAddressLine   String?
+  snapshotAddressNumber String?
+  snapshotAddressComplement String?
+  snapshotNeighborhood  String?
+  snapshotCity          String?
+  snapshotState         String?
+  snapshotZipCode       String?
+  snapshotLatitude      Decimal?          @db.Decimal(10, 8)
+  snapshotLongitude     Decimal?          @db.Decimal(11, 8)
+  snapshotAddressType   AddressType?
+  snapshotAddressLabel  String?
+  snapshotPickupReference String?
+  
+  bookingNumber         String            @unique
+  createdByUserId       String
+  createdAt             DateTime          @default(now())
+  confirmedAt           DateTime          @default(now())
+  
+  modifiedByAdminId     String?
+  modifiedAt            DateTime?
+  
+  cancelledAt           DateTime?
+  completedAt           DateTime?
+  
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer              CustomerProfile   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  serviceMode           ServiceMode       @relation(fields: [serviceModeId], references: [id])
+  serviceRule           ServiceModeRule   @relation(fields: [serviceRuleId], references: [id])
+  createdBy             User              @relation("createdByUser", fields: [createdByUserId], references: [id])
+  modifiedBy            User?             @relation("modifiedByAdmin", fields: [modifiedByAdminId], references: [id])
+  statusHistory         AppointmentStatusHistory[]
+  notifications         Notification[]
+
+  serviceRuleId         String
+
+  @@index([businessId])
+  @@index([customerId])
+  @@index([status])
+  @@index([scheduledStartAt])
+  @@index([vehicleType])
+  @@index([createdAt])
+  @@index([serviceModeId])
+}
+
+model AppointmentStatusHistory {
+  id                    String            @id @default(cuid())
+  appointmentId         String
+  oldStatus             AppointmentStatus?
+  newStatus             AppointmentStatus
+  reason                String?
+  changedAt             DateTime          @default(now())
+
+  appointment           Appointment       @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@index([appointmentId])
+  @@index([changedAt])
+}
+
+model ScheduleBlock {
+  id                    String            @id @default(cuid())
+  businessId            String
+  type                  ScheduleBlockType
+  
+  startAt               DateTime
+  endAt                 DateTime
+  
+  reason                String?
+  
+  isRecurring           Boolean           @default(false)
+  recurringDays         Json?
+  recurringEndDate      DateTime?
+  
+  isActive              Boolean           @default(true)
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([startAt])
+  @@index([isActive])
+}
+
+model Address {
+  id                    String            @id @default(cuid())
+  businessId            String
+  customerId            String?
+  
+  streetAddress         String
+  number                String
+  complement            String?
+  neighborhood          String
+  city                  String
+  state                 String
+  zipCode               String
+  country               String            @default("BR")
+  
+  latitude              Decimal?          @db.Decimal(10, 8)
+  longitude             Decimal?          @db.Decimal(11, 8)
+  
+  addressType           AddressType       @default(RESIDENTIAL)
+  isDefault             Boolean           @default(false)
+  label                 String?
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer              CustomerProfile?  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([customerId])
+  @@index([isDefault])
+}
+
+model ExtraService {
+  id                    String            @id @default(cuid())
+  businessId            String
+  serviceModeId         String?
+  name                  String
+  description           String?
+  imageUrl              String?
+  estimatedPriceInCents Int?
+  isActive              Boolean           @default(true)
+  displayOrder          Int               @default(0)
+
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  serviceMode           ServiceMode?      @relation(fields: [serviceModeId], references: [id], onDelete: SetNull)
+  requests              ExtraServiceRequest[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@index([isActive])
+}
+
+model ExtraServiceRequest {
+  id                    String            @id @default(cuid())
+  businessId            String
+  customerId            String
+  extraServiceId        String
+  
+  status                ExtraServiceRequestStatus @default(PENDING)
+  description           String?
+  quotedPriceInCents    Int?
+  notes                 String?
+  
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  completedAt           DateTime?
+  cancelledAt           DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer              CustomerProfile   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  extraService          ExtraService      @relation(fields: [extraServiceId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([customerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Notification {
+  id                    String            @id @default(cuid())
+  businessId            String
+  userId                String
+  appointmentId         String?
+  type                  NotificationType  @default(GENERAL)
+  title                 String
+  message               String
+  isRead                Boolean           @default(false)
+  createdAt             DateTime          @default(now())
+  readAt                DateTime?
+
+  business              Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user                  User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  appointment           Appointment?      @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+
+  @@index([businessId])
+  @@index([userId])
+  @@index([isRead])
+  @@index([createdAt])
+}
+
+model PushSubscription {
+  id                    String   @id @default(cuid())
+  businessId            String
+  userId                String
+
+  endpoint              String   @unique
+  p256dh                String
+  auth                  String
+
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  business              Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user                  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([userId])
+}
