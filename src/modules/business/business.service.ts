@@ -10,6 +10,14 @@ import { UpdateBusinessSettingsDto } from './dto/update-business-settings.dto';
 import { MapsService } from '../maps/maps.service';
 import { GeocodeAddressDto } from '../maps/dto/geocode-address.dto';
 
+type OperatingPeriod = {
+  open: string;
+  close: string;
+};
+
+type OperatingHoursValue = OperatingPeriod[] | null;
+type OperatingHoursJson = Record<string, OperatingHoursValue>;
+
 @Injectable()
 export class BusinessService {
   constructor(
@@ -24,6 +32,67 @@ export class BusinessService {
       `http://localhost:${process.env.PORT || 3000}`;
 
     return `${baseUrl.replace(/\/$/, '')}/uploads/${fileName}`;
+  }
+
+  private isValidTime(value: string) {
+    return /^([0-1]\d|2[0-3]):([0-5]\d)$/.test(value);
+  }
+
+  private normalizeOperatingHours(raw?: Record<string, any>): OperatingHoursJson {
+    const dayKeys = [
+      'SUNDAY',
+      'MONDAY',
+      'TUESDAY',
+      'WEDNESDAY',
+      'THURSDAY',
+      'FRIDAY',
+      'SATURDAY',
+    ];
+
+    const normalized: OperatingHoursJson = {
+      SUNDAY: null,
+      MONDAY: null,
+      TUESDAY: null,
+      WEDNESDAY: null,
+      THURSDAY: null,
+      FRIDAY: null,
+      SATURDAY: null,
+    };
+
+    for (const day of dayKeys) {
+      const value = raw?.[day];
+
+      if (!value) {
+        normalized[day] = null;
+        continue;
+      }
+
+      const periods = Array.isArray(value)
+        ? value
+        : value?.open && value?.close
+          ? [value]
+          : [];
+
+      const cleaned = periods
+        .filter(
+          (period) =>
+            period &&
+            typeof period.open === 'string' &&
+            typeof period.close === 'string' &&
+            this.isValidTime(period.open) &&
+            this.isValidTime(period.close) &&
+            period.open < period.close,
+        )
+        .map((period) => ({
+          open: period.open,
+          close: period.close,
+        }))
+        .sort((a, b) => a.open.localeCompare(b.open));
+
+      normalized[day] = cleaned.length > 0 ? cleaned : null;
+    }
+
+    return normalized;
   }
 
   async getBusinessById(businessId: string) {
@@ -61,7 +130,9 @@ export class BusinessService {
     return this.prisma.businessSettings.update({
       where: { businessId },
       data: {
-        ...(operatingHoursJson && { operatingHours: operatingHoursJson }),
+        ...(operatingHoursJson && {
+          operatingHours: this.normalizeOperatingHours(operatingHoursJson),
+        }),
         ...(searchFeeUpTo5km !== undefined && { searchFeeUpTo5km }),
         ...(searchFeeOver5km !== undefined && { searchFeeOver5km }),
         ...(searchFeeLimitKm !== undefined && {
@@ -186,6 +257,16 @@ export class BusinessService {
       throw new BadRequestException('Slug já está em uso');
     }
 
+    const defaultOperatingHours = this.normalizeOperatingHours({
+      SUNDAY: null,
+      MONDAY: [{ open: '08:00', close: '18:00' }],
+      TUESDAY: [{ open: '08:00', close: '18:00' }],
+      WEDNESDAY: [{ open: '08:00', close: '18:00' }],
+      THURSDAY: [{ open: '08:00', close: '18:00' }],
+      FRIDAY: [{ open: '08:00', close: '18:00' }],
+      SATURDAY: [{ open: '08:00', close: '14:00' }],
+    });
+
     return this.prisma.business.create({
       data: {
         name,
@@ -200,15 +281,7 @@ export class BusinessService {
         },
         settings: {
           create: {
-            operatingHours: {
-              SUNDAY: null,
-              MONDAY: { open: '08:00', close: '18:00' },
-              TUESDAY: { open: '08:00', close: '18:00' },
-              WEDNESDAY: { open: '08:00', close: '18:00' },
-              THURSDAY: { open: '08:00', close: '18:00' },
-              FRIDAY: { open: '08:00', close: '18:00' },
-              SATURDAY: { open: '08:00', close: '14:00' },
-            },
+            operatingHours: defaultOperatingHours,
             searchFeeUpTo5km: 500,
             searchFeeOver5km: 1000,
             searchFeeLimitKm: new Prisma.Decimal('5.00'),

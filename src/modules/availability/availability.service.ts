@@ -21,11 +21,13 @@ export interface AvailableSlot {
   displayLabel: string;
 }
 
+interface OperatingPeriod {
+  open: string;
+  close: string;
+}
+
 interface OperatingHours {
-  [dayName: string]: {
-    open: string;
-    close: string;
-  };
+  [dayName: string]: OperatingPeriod[] | { open: string; close: string } | null;
 }
 
 @Injectable()
@@ -33,6 +35,32 @@ export class AvailabilityService {
   private readonly EXPLORATION_STEP_MINUTES = 15;
 
   constructor(private prisma: PrismaService) {}
+
+  private normalizeDayPeriods(value: any): OperatingPeriod[] {
+    if (!value) return [];
+
+    const periods = Array.isArray(value)
+      ? value
+      : value?.open && value?.close
+        ? [value]
+        : [];
+
+    return periods
+      .filter(
+        (period) =>
+          period &&
+          typeof period.open === 'string' &&
+          typeof period.close === 'string' &&
+          /^([0-1]\d|2[0-3]):([0-5]\d)$/.test(period.open) &&
+          /^([0-1]\d|2[0-3]):([0-5]\d)$/.test(period.close) &&
+          period.open < period.close,
+      )
+      .map((period) => ({
+        open: period.open,
+        close: period.close,
+      }))
+      .sort((a, b) => a.open.localeCompare(b.open));
+  }
 
   async getAvailableSlots(
     businessId: string,
@@ -74,22 +102,16 @@ export class AvailabilityService {
 
     const operatingHours = business.settings.operatingHours as OperatingHours;
     const dayName = this.getDayName(targetDateInTz);
-    const dayHours = operatingHours?.[dayName];
+    const dayPeriods = this.normalizeDayPeriods(operatingHours?.[dayName]);
 
-    if (!dayHours?.open || !dayHours?.close) {
+    if (dayPeriods.length === 0) {
       return [];
     }
 
-    const businessStartDate = this.combineDateTime(
-      targetDateInTz,
-      dayHours.open,
-      timezone,
-    );
-    const businessEndDate = this.combineDateTime(
-      targetDateInTz,
-      dayHours.close,
-      timezone,
-    );
+    const businessPeriods = dayPeriods.map((period) => ({
+      start: this.combineDateTime(targetDateInTz, period.open, timezone),
+      end: this.combineDateTime(targetDateInTz, period.close, timezone),
+    }));
 
     const minimumAdvanceMinutes =
       business.settings.minimumAdvanceMinutes || 15;
@@ -97,7 +119,7 @@ export class AvailabilityService {
       nowInTz.getTime() + minimumAdvanceMinutes * 60000,
     );
 
-    if (earliestSlotTime > businessEndDate) {
+    if (businessPeriods.every((period) => earliestSlotTime > period.end)) {
       return [];
     }
 
@@ -134,14 +156,20 @@ export class AvailabilityService {
     const allOccupiedBlocks = [...blockTimeBlocks, ...appointmentTimeBlocks];
     const mergedOccupiedBlocks = this.mergeTimeBlocks(allOccupiedBlocks);
 
-    const freeIntervals = this.calculateFreeIntervals(
-      businessStartDate,
-      businessEndDate,
-      mergedOccupiedBlocks,
-    );
+    const allFreeIntervals: TimeBlock[] = [];
+
+    for (const period of businessPeriods) {
+      const freeIntervals = this.calculateFreeIntervals(
+        period.start,
+        period.end,
+        mergedOccupiedBlocks,
+      );
+
+      allFreeIntervals.push(...freeIntervals);
+    }
 
     const startMarkers = this.extractStartMarkers(
-      freeIntervals,
+      allFreeIntervals,
       durationMinutes,
     );
 
@@ -155,7 +183,11 @@ export class AvailabilityService {
       const slotStart = new Date(marker);
       const slotEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
 
-      if (slotEnd > businessEndDate) {
+      const fitsInSomePeriod = businessPeriods.some(
+        (period) => slotStart >= period.start && slotEnd <= period.end,
+      );
+
+      if (!fitsInSomePeriod) {
         continue;
       }
 
@@ -215,22 +247,20 @@ export class AvailabilityService {
 
       const operatingHours = business.settings.operatingHours as OperatingHours;
       const dayName = this.getDayName(targetDateInTz);
-      const dayHours = operatingHours?.[dayName];
+      const dayPeriods = this.normalizeDayPeriods(operatingHours?.[dayName]);
 
-      if (!dayHours?.open || !dayHours?.close) return false;
+      if (dayPeriods.length === 0) return false;
 
-      const businessStart = this.combineDateTime(
-        targetDateInTz,
-        dayHours.open,
-        timezone,
-      );
-      const businessEnd = this.combineDateTime(
-        targetDateInTz,
-        dayHours.close,
-        timezone,
+      const businessPeriods = dayPeriods.map((period) => ({
+        start: this.combineDateTime(targetDateInTz, period.open, timezone),
+        end: this.combineDateTime(targetDateInTz, period.close, timezone),
+      }));
+
+      const fitsInSomePeriod = businessPeriods.some(
+        (period) => slotStart >= period.start && slotEnd <= period.end,
       );
 
-      if (slotStart < businessStart || slotEnd > businessEnd) {
+      if (!fitsInSomePeriod) {
         return false;
       }
 

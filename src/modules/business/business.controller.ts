@@ -171,7 +171,8 @@ export class BusinessController {
     ensureUploadDirExists();
 
     const baseName = sanitizeBaseName(file.originalname) || 'arquivo';
-    const finalExtension = detectedType.ext === 'jpeg' ? 'jpg' : detectedType.ext;
+    const finalExtension =
+      detectedType.ext === 'jpeg' ? 'jpg' : detectedType.ext;
     const fileName = `${Date.now()}-${Math.round(
       Math.random() * 1e9,
     )}-${baseName}.${finalExtension}`;
