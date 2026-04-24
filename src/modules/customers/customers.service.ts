@@ -76,7 +76,7 @@ export class CustomersService {
 
     const generatedEmail =
       data.email?.trim().toLowerCase() ||
-      `cliente.${Date.now()}@washhub.local`;
+      `cliente.${Date.now()}@washsync.local`;
 
     const existingUser = await this.prisma.user.findFirst({
       where: {
