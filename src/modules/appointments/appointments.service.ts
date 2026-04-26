@@ -108,31 +108,32 @@ export class AppointmentsService {
     let searchFeeInCents = 0;
 
     if (willSearchVehicle) {
-      const estimate = await this.estimateSearchFee(businessId, customerId, {
-        serviceModeId,
-        vehicleType,
-        willSearchVehicle,
-        searchType,
-        serviceAddressId,
-        streetAddress,
-        number,
-        neighborhood,
-        city,
-        state,
-        zipCode,
-        latitude,
-        longitude,
-        pickupReference,
-      });
+  if (!searchType) {
+    throw new BadRequestException(
+      'searchType é obrigatório quando willSearchVehicle é true',
+    );
+  }
 
-      calculatedDistanceKm = estimate.distanceKm;
-      searchFeeInCents = estimate.searchFeeInCents;
+  if (searchType === SearchType.CURRENT_LOCATION) {
+    const estimate = await this.estimateSearchFee(businessId, customerId, {
+      serviceModeId,
+      vehicleType,
+      willSearchVehicle,
+      searchType,
+      serviceAddressId,
+      latitude,
+      longitude,
+      pickupReference,
+    });
 
-      if (!searchType) {
-        throw new BadRequestException(
-          'searchType é obrigatório quando willSearchVehicle é true',
-        );
-      }
+    calculatedDistanceKm = estimate.distanceKm;
+    searchFeeInCents = estimate.searchFeeInCents;
+  }
+
+  if (searchType === SearchType.MANUAL_ADDRESS) {
+    calculatedDistanceKm = 0;
+    searchFeeInCents = 0;
+  }
 
       if (searchType === SearchType.CURRENT_LOCATION) {
         selectedAddress = {
@@ -182,35 +183,19 @@ export class AppointmentsService {
             label: savedAddress.label,
           };
         } else {
-          const geo =
-            streetAddress && city && state
-              ? await this.resolveAddressCoordinatesFromManualAddress({
-                  streetAddress,
-                  number,
-                  neighborhood,
-                  city,
-                  state,
-                  zipCode,
-                  latitude,
-                  longitude,
-                })
-              : null;
-
           selectedAddress = {
-            streetAddress: streetAddress || '',
-            number: number || '',
-            complement: complement || null,
-            neighborhood: neighborhood || '',
-            city: city || '',
-            state: state || '',
-            zipCode: zipCode || '',
-            latitude:
-              geo?.latitude != null ? new Prisma.Decimal(geo.latitude) : null,
-            longitude:
-              geo?.longitude != null ? new Prisma.Decimal(geo.longitude) : null,
-            addressType: addressType || 'OTHER',
-            label: addressLabel || 'Endereço manual',
-          };
+  streetAddress: streetAddress || '',
+  number: number || '',
+  complement: complement || null,
+  neighborhood: neighborhood || '',
+  city: city || '',
+  state: state || '',
+  zipCode: zipCode || '',
+  latitude: null,
+  longitude: null,
+  addressType: addressType || 'OTHER',
+  label: addressLabel || 'Endereço manual',
+};
         }
       }
     }
