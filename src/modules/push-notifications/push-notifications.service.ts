@@ -77,10 +77,19 @@ export class PushNotificationsService {
 
     if (!subscriptions.length) return;
 
+    const business = await this.prisma.business.findUnique({
+      where: { id: params.businessId },
+      select: { slug: true },
+    });
+
+    const defaultUrl = business?.slug
+      ? `/empresa/${business.slug}/my-appointments`
+      : '/my-appointments';
+
     const payload = JSON.stringify({
       title: params.title,
       body: params.body,
-      url: params.url || '/notifications',
+      url: params.url || defaultUrl,
     });
 
     await Promise.allSettled(
@@ -106,7 +115,9 @@ export class PushNotificationsService {
           }
 
           this.logger.warn(
-            `Falha ao enviar push para endpoint ${sub.endpoint}: ${error?.message || error}`,
+            `Falha ao enviar push para endpoint ${sub.endpoint}: ${
+              error?.message || error
+            }`,
           );
         }
       }),
