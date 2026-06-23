@@ -330,6 +330,83 @@ export class BusinessService {
     return this.mapsService.geocodeAddress(address);
   }
 
+  async searchPublicBusinesses(query: string) {
+  const searchTerm = query.trim();
+
+  if (!searchTerm || searchTerm.length < 2) {
+    return [];
+  }
+
+  const normalizedSlugTerm = searchTerm
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9-]/g, '');
+
+  const businesses = await this.prisma.business.findMany({
+    where: {
+      isActive: true,
+      deletedAt: null,
+      OR: [
+        {
+          name: {
+            contains: searchTerm,
+            mode: Prisma.QueryMode.insensitive,
+          },
+        },
+        {
+          slug: {
+            contains: normalizedSlugTerm || searchTerm,
+            mode: Prisma.QueryMode.insensitive,
+          },
+        },
+        {
+          businessAddress: {
+            is: {
+              city: {
+                contains: searchTerm,
+                mode: Prisma.QueryMode.insensitive,
+              },
+            },
+          },
+        },
+        {
+          businessAddress: {
+            is: {
+              state: {
+                contains: searchTerm,
+                mode: Prisma.QueryMode.insensitive,
+              },
+            },
+          },
+        },
+      ],
+    },
+    include: {
+      branding: true,
+      businessAddress: true,
+    },
+    orderBy: {
+      name: 'asc',
+    },
+    take: 10,
+  });
+
+  return businesses.map((business) => ({
+    id: business.id,
+    name: business.name,
+    slug: business.slug,
+    logoUrl: business.branding?.logoUrl || null,
+    iconUrl: business.branding?.iconUrl || null,
+    primaryColor: business.branding?.primaryColor || '#0066CC',
+    secondaryColor: business.branding?.secondaryColor || '#FF6B35',
+    accentColor: business.branding?.accentColor || '#00D4FF',
+    city: business.businessAddress?.city || null,
+    state: business.businessAddress?.state || null,
+  }));
+}
+
   async getPublicBusinessBySlug(slug: string) {
     const normalizedSlug = slug.trim().toLowerCase();
 
