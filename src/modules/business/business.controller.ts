@@ -11,9 +11,6 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { memoryStorage } from 'multer';
-import * as fs from 'fs';
-import { promises as fsPromises } from 'fs';
-import { join } from 'path';
 import { fileTypeFromBuffer } from 'file-type';
 
 import { JwtGuard } from 'src/common/guards/jwt.guard';
@@ -22,6 +19,10 @@ import {
   CurrentUser,
   CurrentUserPayload,
 } from 'src/common/decorators/current-user.decorator';
+import {
+  sanitizeCloudinaryName,
+  uploadImageBufferToCloudinary,
+} from 'src/common/storage/cloudinary-upload';
 
 import { BusinessService } from './business.service';
 import { UpdateBusinessSettingsDto } from './dto/update-business-settings.dto';
@@ -29,29 +30,10 @@ import { UpdateBusinessBrandingDto } from './dto/update-business-branding.dto';
 import { UpdateBusinessAddressDto } from './dto/update-business-address.dto';
 import { GeocodeAddressDto } from '../maps/dto/geocode-address.dto';
 
-const UPLOAD_DIR = './uploads';
 const MAX_FILE_SIZE = 2 * 1024 * 1024;
 
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const ALLOWED_REAL_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp'];
-
-function ensureUploadDirExists() {
-  if (!fs.existsSync(UPLOAD_DIR)) {
-    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  }
-}
-
-function sanitizeBaseName(fileName: string) {
-  return fileName
-    .replace(/\.[^/.]+$/, '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9_-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .toLowerCase()
-    .slice(0, 50);
-}
 
 @Controller('business')
 @UseGuards(JwtGuard)
@@ -168,24 +150,22 @@ export class BusinessController {
       );
     }
 
-    ensureUploadDirExists();
+    const baseName = sanitizeCloudinaryName(file.originalname) || 'logo';
 
-    const baseName = sanitizeBaseName(file.originalname) || 'arquivo';
-    const finalExtension =
-      detectedType.ext === 'jpeg' ? 'jpg' : detectedType.ext;
-    const fileName = `${Date.now()}-${Math.round(
+    const publicId = `${Date.now()}-${Math.round(
       Math.random() * 1e9,
-    )}-${baseName}.${finalExtension}`;
+    )}-${baseName}`;
 
-    const fullPath = join(UPLOAD_DIR, fileName);
-
-    await fsPromises.writeFile(fullPath, file.buffer);
-
-    const url = this.businessService.buildUploadUrl(fileName);
+    const uploaded = await uploadImageBufferToCloudinary({
+      buffer: file.buffer,
+      folder: `washsync/businesses/${user.businessId}/branding`,
+      publicId,
+    });
 
     return {
-      url,
-      filename: fileName,
+      url: uploaded.secure_url,
+      filename: uploaded.public_id,
+      publicId: uploaded.public_id,
       contentType: detectedType.mime,
       size: file.size,
       businessId: user.businessId,
