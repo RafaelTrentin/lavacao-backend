@@ -5,6 +5,10 @@ import {
   CurrentUserPayload,
 } from 'src/common/decorators/current-user.decorator';
 import { PushNotificationsService } from './push-notifications.service';
+import {
+  RegisterPushDeviceDto,
+  UnregisterPushDeviceDto,
+} from './dto/register-push-device.dto';
 
 @Controller('push-notifications')
 @UseGuards(JwtGuard)
@@ -23,10 +27,7 @@ export class PushNotificationsController {
     @Body()
     body: {
       endpoint: string;
-      keys: {
-        p256dh: string;
-        auth: string;
-      };
+      keys: { p256dh: string; auth: string };
     },
     @CurrentUser() user: CurrentUserPayload,
   ) {
@@ -49,5 +50,44 @@ export class PushNotificationsController {
       user.userId,
       user.businessId,
     );
+  }
+
+  @Post('devices/status')
+  async getDeviceStatus(
+    @Body('token') token: string,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return this.pushNotificationsService.getDeviceStatus({
+      businessId: user.businessId,
+      userId: user.userId,
+      token,
+    });
+  }
+
+  @Post('devices')
+  async registerDevice(
+    @Body() body: RegisterPushDeviceDto,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return this.pushNotificationsService.registerDevice({
+      businessId: user.businessId,
+      userId: user.userId,
+      platform: body.platform,
+      token: body.token,
+      installationId: body.installationId,
+      revocationKey: body.revocationKey,
+    });
+  }
+
+  @Delete('devices')
+  async unregisterDevice(
+    @Body() body: UnregisterPushDeviceDto,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return this.pushNotificationsService.unregisterDevice({
+      businessId: user.businessId,
+      userId: user.userId,
+      token: body.token,
+    });
   }
 }

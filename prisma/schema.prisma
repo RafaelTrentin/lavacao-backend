@@ -85,6 +85,7 @@ model Business {
   addresses            Address[]
   notifications        Notification[]
   pushSubscriptions    PushSubscription[]
+  pushDevices          PushDevice[]
 
   @@index([isActive])
   @@index([createdAt])
@@ -165,7 +166,7 @@ model User {
   businessId   String
   isActive     Boolean   @default(true)
   lastLoginAt  DateTime?
-  tokenVersion Int @default(0)
+  tokenVersion Int       @default(0)
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -180,6 +181,7 @@ model User {
   appointmentsModified Appointment[]        @relation("modifiedByAdmin")
   notifications        Notification[]
   pushSubscriptions    PushSubscription[]
+  pushDevices          PushDevice[]
 
   @@unique([email, businessId])
   @@index([businessId])
@@ -539,4 +541,29 @@ model PushSubscription {
 
   @@index([businessId])
   @@index([userId])
+}
+
+enum PushPlatform {
+  ANDROID
+  IOS
+}
+
+model PushDevice {
+  id                String       @id @default(cuid())
+  businessId        String
+  userId            String
+  installationId    String?
+  revocationKeyHash String?      @unique
+  platform          PushPlatform
+  token             String       @unique
+  isActive          Boolean      @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, userId, isActive])
+  @@index([installationId])
 }

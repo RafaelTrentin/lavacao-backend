@@ -112,39 +112,46 @@ export class BusinessService {
     return business;
   }
 
-  async updateBusinessSettings(
-    businessId: string,
-    updateBusinessSettingsDto: UpdateBusinessSettingsDto,
-  ) {
-    await this.getBusinessById(businessId);
+async updateBusinessSettings(
+  businessId: string,
+  updateBusinessSettingsDto: UpdateBusinessSettingsDto,
+) {
+  await this.getBusinessById(businessId);
 
-    const {
-      operatingHoursJson,
-      searchFeeUpTo5km,
-      searchFeeOver5km,
-      searchFeeLimitKm,
-      whatsappPhone,
+  const {
+    operatingHoursJson,
+    searchFeeUpTo5km,
+    searchFeeOver5km,
+    searchFeeLimitKm,
+    whatsappPhone,
+    minimumAdvanceMinutes,
+  } = updateBusinessSettingsDto;
+
+  const data = {
+    ...(operatingHoursJson !== undefined && {
+      operatingHours: this.normalizeOperatingHours(operatingHoursJson),
+    }),
+    ...(searchFeeUpTo5km !== undefined && { searchFeeUpTo5km }),
+    ...(searchFeeOver5km !== undefined && { searchFeeOver5km }),
+    ...(searchFeeLimitKm !== undefined && {
+      searchFeeLimitKm: new Prisma.Decimal(searchFeeLimitKm),
+    }),
+    ...(whatsappPhone !== undefined && { whatsappPhone }),
+    ...(minimumAdvanceMinutes !== undefined && {
       minimumAdvanceMinutes,
-    } = updateBusinessSettingsDto;
+    }),
+  };
 
-    return this.prisma.businessSettings.update({
-      where: { businessId },
-      data: {
-        ...(operatingHoursJson && {
-          operatingHours: this.normalizeOperatingHours(operatingHoursJson),
-        }),
-        ...(searchFeeUpTo5km !== undefined && { searchFeeUpTo5km }),
-        ...(searchFeeOver5km !== undefined && { searchFeeOver5km }),
-        ...(searchFeeLimitKm !== undefined && {
-          searchFeeLimitKm: new Prisma.Decimal(searchFeeLimitKm),
-        }),
-        ...(whatsappPhone !== undefined && { whatsappPhone }),
-        ...(minimumAdvanceMinutes !== undefined && {
-          minimumAdvanceMinutes,
-        }),
-      },
-    });
-  }
+  return this.prisma.businessSettings.upsert({
+    where: { businessId },
+    create: {
+      businessId,
+      ...data,
+    },
+    update: data,
+  });
+}
+
 
   async updateBusinessBranding(
     businessId: string,

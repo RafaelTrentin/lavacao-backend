@@ -3,6 +3,7 @@ import {
   BadRequestException,
   NotFoundException,
   ConflictException,
+  Logger,
 } from '@nestjs/common';
 import {
   Prisma,
@@ -20,6 +21,7 @@ import { PushNotificationsService } from '../push-notifications/push-notificatio
 
 @Injectable()
 export class AppointmentsService {
+  private readonly logger = new Logger(AppointmentsService.name);
   constructor(
     private prisma: PrismaService,
     private availabilityService: AvailabilityService,
@@ -27,6 +29,67 @@ export class AppointmentsService {
     private notificationsService: NotificationsService,
     private pushNotificationsService: PushNotificationsService,
   ) {}
+
+private async notifyAdminsAboutNewAppointment(
+  businessId: string,
+  appointmentId: string,
+  bookingNumber: string,
+): Promise<void> {
+  try {
+    const admins = await this.prisma.user.findMany({
+      where: {
+        businessId,
+        role: 'ADMIN',
+        isActive: true,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+      },
+    });
+
+    const title = 'Novo agendamento recebido';
+    const message = `Um cliente realizou o agendamento #${bookingNumber}.`;
+
+    const results = await Promise.allSettled(
+      admins.map(async (admin) => {
+        await this.notificationsService.createForUser({
+          businessId,
+          userId: admin.id,
+          appointmentId,
+          type: NotificationType.GENERAL,
+          title,
+          message,
+        });
+
+        await this.pushNotificationsService.sendToUser({
+          businessId,
+          userId: admin.id,
+          title,
+          body: message,
+          url: '/notifications',
+        });
+      }),
+    );
+
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        this.logger.error(
+          `Falha ao notificar administrador ${admins[index].id}`,
+          result.reason instanceof Error
+            ? result.reason.stack
+            : String(result.reason),
+        );
+      }
+    });
+  } catch (error) {
+    this.logger.error(
+      `Falha ao preparar notificações do agendamento ${appointmentId}`,
+      error instanceof Error ? error.stack : String(error),
+    );
+  }
+}
+
 
   async createAppointment(
     businessId: string,
@@ -306,6 +369,12 @@ export class AppointmentsService {
       {
         timeout: 10000,
       },
+    );
+
+    await this.notifyAdminsAboutNewAppointment(
+      businessId,
+      appointment.id,
+      appointment.bookingNumber,
     );
 
     return this.serializeAppointment(appointment);
@@ -598,42 +667,87 @@ export class AppointmentsService {
     });
   }
 
-  async completeAppointment(
-    appointmentId: string,
-    businessId: string,
-    adminId: string,
-  ) {
-    const appointment = await this.getAppointmentById(appointmentId, businessId);
 
-    if (appointment.status !== AppointmentStatus.IN_PROGRESS) {
-      throw new BadRequestException(
-        'Apenas agendamentos em andamento podem ser concluídos',
-      );
-    }
+async completeAppointment(
+  appointmentId: string,
+  businessId: string,
+  adminId: string,
+) {
+  const appointment = await this.getAppointmentById(
+    appointmentId,
+    businessId,
+  );
 
-    return this.prisma.$transaction(async (tx) => {
-      const updated = await tx.appointment.update({
-        where: { id: appointmentId },
-        data: {
-          status: AppointmentStatus.COMPLETED,
-          completedAt: new Date(),
-          modifiedByAdminId: adminId,
-          modifiedAt: new Date(),
-        },
-      });
-
-      await tx.appointmentStatusHistory.create({
-        data: {
-          appointmentId,
-          oldStatus: appointment.status,
-          newStatus: AppointmentStatus.COMPLETED,
-          reason: 'Finalizado pelo admin',
-        },
-      });
-
-      return updated;
-    });
+  if (appointment.status !== AppointmentStatus.IN_PROGRESS) {
+    throw new BadRequestException(
+      'Apenas agendamentos em andamento podem ser concluídos',
+    );
   }
+
+  const updated = await this.prisma.$transaction(async (tx) => {
+    const result = await tx.appointment.update({
+      where: { id: appointmentId },
+      data: {
+        status: AppointmentStatus.COMPLETED,
+        completedAt: new Date(),
+        modifiedByAdminId: adminId,
+        modifiedAt: new Date(),
+      },
+    });
+
+    await tx.appointmentStatusHistory.create({
+      data: {
+        appointmentId,
+        oldStatus: appointment.status,
+        newStatus: AppointmentStatus.COMPLETED,
+        reason: 'Finalizado pelo admin',
+      },
+    });
+
+    return result;
+  });
+
+  // A transação já foi concluída.
+  // Uma falha na notificação não desfaz a conclusão do serviço.
+  const title = 'Seu veículo está pronto!';
+  const message =
+    `O atendimento do seu agendamento #${appointment.bookingNumber} ` +
+    'foi concluído. Obrigado por escolher nossa lavação!';
+
+  try {
+    await this.notificationsService.createForUser({
+      businessId,
+      userId: appointment.customer.userId,
+      appointmentId: appointment.id,
+      type: NotificationType.GENERAL,
+      title,
+      message,
+    });
+  } catch (error) {
+    this.logger.error(
+      `Falha ao registrar notificação de conclusão ${appointmentId}`,
+      error instanceof Error ? error.stack : String(error),
+    );
+  }
+
+  try {
+    await this.pushNotificationsService.sendToUser({
+      businessId,
+      userId: appointment.customer.userId,
+      title,
+      body: message,
+      url: '/notifications',
+    });
+  } catch (error) {
+    this.logger.error(
+      `Falha ao enviar push de conclusão ${appointmentId}`,
+      error instanceof Error ? error.stack : String(error),
+    );
+  }
+
+  return updated;
+}
+
 
   async getCustomerAppointments(customerId: string, businessId: string) {
     return this.prisma.appointment.findMany({
