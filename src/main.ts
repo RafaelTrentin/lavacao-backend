@@ -10,6 +10,18 @@ import rateLimit from 'express-rate-limit';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
+  const requiredSecrets = ['JWT_SECRET', 'JWT_REFRESH_SECRET'] as const;
+
+  for (const key of requiredSecrets) {
+    const value = process.env[key];
+
+    if (!value || !value.trim()) {
+      throw new Error(
+        `Configuracao obrigatoria ausente: ${key}`,
+      );
+    }
+  }
+
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   const uploadsPath = join(process.cwd(), 'uploads');
@@ -59,9 +71,23 @@ async function bootstrap() {
     },
   });
 
+const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    message:
+      'Muitas solicitações de recuperação. Aguarde 15 minutos e tente novamente.',
+  },
+});
+
   app.use('/auth/login', authLimiter);
   app.use('/auth/signup', authLimiter);
   app.use('/auth/refresh', refreshLimiter);
+
+  app.use('/auth/forgot-password', passwordResetLimiter);
+  app.use('/auth/reset-password', passwordResetLimiter);
 
   app.enableCors({
     origin: process.env.CORS_ORIGIN?.split(',') || 'http://localhost:3000',
