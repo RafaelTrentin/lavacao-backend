@@ -24,6 +24,20 @@ async function bootstrap() {
 
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
+  // Confia no proxy reverso diretamente à frente da aplicação.
+// Necessário para identificar corretamente o IP no rate limiter.
+app.set('trust proxy', 1);
+app.use('/auth/login', (req, _res, next) => {
+  console.log('[Proxy Check]', {
+    ipIdentificado: Boolean(req.ip),
+    forwardedForPresente: Boolean(req.headers['x-forwarded-for']),
+    quantidadeHops: String(req.headers['x-forwarded-for'] || '')
+      .split(',')
+      .filter(Boolean).length,
+  });
+  next();
+});
+
   const uploadsPath = join(process.cwd(), 'uploads');
 
   if (!fs.existsSync(uploadsPath)) {
