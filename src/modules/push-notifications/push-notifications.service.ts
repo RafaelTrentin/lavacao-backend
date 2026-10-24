@@ -95,36 +95,51 @@ export class PushNotificationsService {
       url: params.url || defaultUrl,
     });
 
-    await Promise.allSettled(
+    if (subscriptions.length > 0) {
+      this.logger.log(
+        `Web Push: iniciando envio para ${subscriptions.length} inscrição(ões) da empresa ${params.businessId}.`,
+      );
+    }
+
+    const webPushResults = await Promise.allSettled(
       subscriptions.map(async (sub) => {
         try {
           await webpush.sendNotification(
             {
               endpoint: sub.endpoint,
-              keys: {
-                p256dh: sub.p256dh,
-                auth: sub.auth,
-              },
+              keys: { p256dh: sub.p256dh, auth: sub.auth },
             },
             payload,
           );
+          return true;
         } catch (error: any) {
           const statusCode = error?.statusCode;
-
           if (statusCode === 404 || statusCode === 410) {
             await this.prisma.pushSubscription.deleteMany({
-              where: { endpoint: sub.endpoint },
+              where: {
+                endpoint: sub.endpoint,
+                userId: params.userId,
+                businessId: params.businessId,
+              },
             });
           }
-
+          // Não registrar o endpoint: ele é uma URL sensível.
           this.logger.warn(
-            `Falha ao enviar push para endpoint ${sub.endpoint}: ${
-              error?.message || error
-            }`,
+            `Web Push não entregue: HTTP ${statusCode ?? 'sem status'}; código ${error?.code || 'indisponível'}.`,
           );
+          return false;
         }
       }),
     );
+
+    if (subscriptions.length > 0) {
+      const succeeded = webPushResults.filter(
+        (result) => result.status === 'fulfilled' && result.value === true,
+      ).length;
+      this.logger.log(
+        `Web Push: ${succeeded}/${subscriptions.length} envio(s) aceito(s) pelo serviço de push.`,
+      );
+    }
     // Notificações nativas Android; integração iOS FCM ainda pendente.
     if (!this.firebaseMessaging.isAvailable()) {
       return;
