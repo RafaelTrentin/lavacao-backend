@@ -25,6 +25,11 @@ export class AuthService {
   async signup(signupDto: SignupDto): Promise<TokenDto> {
     const { email, password, name, phone, role, businessSlug } = signupDto;
 
+    // Defesa também para chamadas internas que não passam pelo ValidationPipe.
+    if (role !== UserRole.CUSTOMER) {
+      throw new BadRequestException('O cadastro público permite somente CUSTOMER');
+    }
+
     const normalizedEmail = email.trim().toLowerCase();
     const normalizedSlug = businessSlug.trim().toLowerCase();
 
@@ -57,26 +62,18 @@ export class AuthService {
       data: {
         email: normalizedEmail,
         passwordHash,
-        role,
+        role: UserRole.CUSTOMER,
         businessId: business.id,
         isActive: true,
-        ...(role === UserRole.ADMIN && {
-          adminProfile: {
-            create: { name },
+        customerProfile: {
+          create: {
+            name,
+            phone,
+            businessId: business.id,
           },
-        }),
-        ...(role === UserRole.CUSTOMER && {
-          customerProfile: {
-            create: {
-              name,
-              phone,
-              businessId: business.id,
-            },
-          },
-        }),
+        },
       },
       include: {
-        adminProfile: true,
         customerProfile: true,
       },
     });
@@ -90,6 +87,9 @@ export class AuthService {
     const normalizedEmail = email.trim().toLowerCase();
 
     let user = null;
+    const invalidCredentials = businessSlug?.trim()
+      ? 'Credenciais inválidas'
+      : 'Não foi possível entrar. Confira suas credenciais ou selecione a lavação e entre pela tela dela.';
 
     if (businessSlug?.trim()) {
       const normalizedSlug = businessSlug.trim().toLowerCase();
@@ -103,31 +103,43 @@ export class AuthService {
       });
 
       if (!business) {
-        throw new UnauthorizedException('Empresa não encontrada');
+        throw new UnauthorizedException(invalidCredentials);
       }
 
       user = await this.prisma.user.findFirst({
         where: {
           email: normalizedEmail,
           businessId: business.id,
+          isActive: true,
+          deletedAt: null,
         },
       });
     } else {
-      user = await this.prisma.user.findFirst({
+      // Sem contexto, só existe uma escolha segura se houver um único ADMIN
+      // elegível. A senha não deve ser usada para escolher entre empresas.
+      const candidates = await this.prisma.user.findMany({
         where: {
           email: normalizedEmail,
           role: UserRole.ADMIN,
+          isActive: true,
+          deletedAt: null,
+          business: { isActive: true, deletedAt: null },
         },
+        take: 2,
       });
+      if (candidates.length !== 1) {
+        throw new UnauthorizedException(invalidCredentials);
+      }
+      user = candidates[0];
     }
 
     if (!user || !user.isActive) {
-      throw new UnauthorizedException('Credenciais inválidas');
+      throw new UnauthorizedException(invalidCredentials);
     }
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
     if (!passwordMatch) {
-      throw new UnauthorizedException('Credenciais inválidas');
+      throw new UnauthorizedException(invalidCredentials);
     }
 
     await this.prisma.user.update({
@@ -206,6 +218,24 @@ const payload = {
         secret: process.env.JWT_REFRESH_SECRET!,
       });
 
+      if (typeof decoded.sub !== 'string' || !decoded.sub) {
+        throw new UnauthorizedException('Refresh token inválido');
+      }
+      const user = await this.prisma.user.findUnique({
+        where: { id: decoded.sub },
+        select: {
+          businessId: true, tokenVersion: true, isActive: true, deletedAt: true,
+          business: { select: { isActive: true, deletedAt: true } },
+        },
+      });
+      const version = decoded.tokenVersion ?? 0;
+      if (!user || !user.isActive || user.deletedAt !== null ||
+          !user.business?.isActive || user.business.deletedAt !== null ||
+          decoded.businessId !== user.businessId ||
+          !Number.isInteger(version) || version !== user.tokenVersion) {
+        throw new UnauthorizedException('Refresh token inválido');
+      }
+
       const storedTokens = await this.prisma.refreshToken.findMany({
         where: {
           userId: decoded.sub,
@@ -256,6 +286,12 @@ const payload = {
 
     const normalizedEmail = email.trim().toLowerCase();
     const normalizedSlug = businessSlug.trim().toLowerCase();
+
+    // Endereços internos de contatos presenciais não são caixas de e-mail.
+    // Não emitir tokens nem tentar entregar recuperação para esses registros.
+    if (normalizedEmail.endsWith('@washsync.local')) {
+      return genericResponse;
+    }
 
     const business = await this.prisma.business.findFirst({
       where: {

@@ -1,4 +1,4 @@
-import { IsEmail, IsString, MinLength, IsEnum } from 'class-validator';
+import { IsEmail, IsString, MinLength, Equals, Matches } from 'class-validator';
 import { UserRole } from 'src/common/enums';
 
 export class SignupDto {
@@ -16,9 +16,12 @@ export class SignupDto {
   @IsString()
   phone: string;
 
-  @IsEnum(UserRole)
-  role: UserRole;
+  @Equals(UserRole.CUSTOMER, {
+    message: 'O cadastro público permite somente CUSTOMER',
+  })
+  role: UserRole.CUSTOMER;
 
   @IsString()
+  @Matches(/\S/, { message: 'Informe o slug da empresa' })
   businessSlug: string;
 }

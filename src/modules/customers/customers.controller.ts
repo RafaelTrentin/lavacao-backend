@@ -28,7 +28,8 @@ export class CustomersController {
   @Get('profile')
   async getProfile(@CurrentUser() user: CurrentUserPayload) {
     const customerProfile = await this.prisma.customerProfile.findUnique({
-      where: { userId: user.userId },
+      where: { userId: user.userId, businessId: user.businessId },
+      select: { id: true },
     });
 
     if (!customerProfile) {
@@ -47,7 +48,8 @@ export class CustomersController {
     @CurrentUser() user: CurrentUserPayload,
   ) {
     const customerProfile = await this.prisma.customerProfile.findUnique({
-      where: { userId: user.userId },
+      where: { userId: user.userId, businessId: user.businessId },
+      select: { id: true },
     });
 
     if (!customerProfile) {

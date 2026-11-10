@@ -5,6 +5,7 @@ import {
   CurrentUserPayload,
 } from 'src/common/decorators/current-user.decorator';
 import { PushNotificationsService } from './push-notifications.service';
+import { SubscribePushDto } from './dto/subscribe-push.dto';
 import {
   RegisterPushDeviceDto,
   UnregisterPushDeviceDto,
@@ -25,10 +26,7 @@ export class PushNotificationsController {
   @Post('subscribe')
   async subscribe(
     @Body()
-    body: {
-      endpoint: string;
-      keys: { p256dh: string; auth: string };
-    },
+    body: SubscribePushDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
     return this.pushNotificationsService.saveSubscription({

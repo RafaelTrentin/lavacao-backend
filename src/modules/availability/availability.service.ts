@@ -87,8 +87,8 @@ export class AvailabilityService {
 
     const serviceRule = await this.prisma.serviceModeRule.findFirst({
       where: {
-        serviceMode: { id: serviceModeId, businessId },
-        vehicleType: { kind: vehicleType },
+        serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
+        vehicleType: { kind: vehicleType, businessId, deletedAt: null },
       },
     });
 
@@ -219,8 +219,8 @@ export class AvailabilityService {
 
       const serviceRule = await this.prisma.serviceModeRule.findFirst({
         where: {
-          serviceMode: { id: serviceModeId, businessId },
-          vehicleType: { kind: vehicleType },
+          serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
+          vehicleType: { kind: vehicleType, businessId, deletedAt: null },
         },
       });
 

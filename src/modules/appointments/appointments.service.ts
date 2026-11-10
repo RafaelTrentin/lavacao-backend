@@ -134,6 +134,7 @@ private async notifyAdminsAboutNewAppointment(
     if (
       !serviceMode ||
       serviceMode.businessId !== businessId ||
+      serviceMode.deletedAt ||
       !serviceMode.isActive
     ) {
       throw new BadRequestException('Modalidade inválida ou desativada');
@@ -141,8 +142,8 @@ private async notifyAdminsAboutNewAppointment(
 
     const serviceRule = await this.prisma.serviceModeRule.findFirst({
       where: {
-        serviceMode: { id: serviceModeId, businessId },
-        vehicleType: { kind: vehicleType },
+        serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
+        vehicleType: { kind: vehicleType, businessId, deletedAt: null },
       },
     });
 
@@ -224,6 +225,7 @@ private async notifyAdminsAboutNewAppointment(
 
           if (
             !savedAddress ||
+            savedAddress.deletedAt ||
             savedAddress.businessId !== businessId ||
             savedAddress.customerId !== customerId
           ) {
@@ -795,7 +797,7 @@ async completeAppointment(
       },
     });
 
-    if (!appointment || appointment.businessId !== businessId) {
+    if (!appointment || appointment.businessId !== businessId || appointment.deletedAt) {
       throw new NotFoundException('Agendamento não encontrado');
     }
 
@@ -818,6 +820,7 @@ async completeAppointment(
 
     if (
       !appointment ||
+      appointment.deletedAt ||
       appointment.businessId !== businessId ||
       appointment.customerId !== customerId
     ) {
@@ -973,8 +976,8 @@ async completeAppointment(
 
     const serviceRule = await this.prisma.serviceModeRule.findFirst({
       where: {
-        serviceMode: { id: dto.serviceModeId, businessId },
-        vehicleType: { kind: dto.vehicleType },
+        serviceMode: { id: dto.serviceModeId, businessId, isActive: true, deletedAt: null },
+        vehicleType: { kind: dto.vehicleType, businessId, deletedAt: null },
       },
     });
 
@@ -1022,6 +1025,7 @@ async completeAppointment(
 
         if (
           !savedAddress ||
+          savedAddress.deletedAt ||
           savedAddress.businessId !== businessId ||
           savedAddress.customerId !== customerId
         ) {

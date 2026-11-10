@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { FirebaseMessagingService } from './firebase-messaging.service';
 import { createHash } from 'node:crypto';
@@ -32,24 +32,48 @@ export class PushNotificationsService {
     p256dh: string;
     auth: string;
   }) {
-    return this.prisma.pushSubscription.upsert({
-      where: {
-        endpoint: params.endpoint,
-      },
-      update: {
-        p256dh: params.p256dh,
-        auth: params.auth,
-        userId: params.userId,
-        businessId: params.businessId,
-      },
-      create: {
-        businessId: params.businessId,
-        userId: params.userId,
-        endpoint: params.endpoint,
-        p256dh: params.p256dh,
-        auth: params.auth,
-      },
-    });
+    if (![params.endpoint, params.p256dh, params.auth].every((value) => typeof value === 'string' && value.trim())) {
+      throw new BadRequestException('Inscrição inválida.');
+    }
+    try {
+      return await this.prisma.pushSubscription.upsert({
+        where: {
+          endpoint: params.endpoint,
+          // A browser can switch accounts with its existing subscription keys.
+          // Knowing only another browser's endpoint must not transfer ownership.
+          OR: [
+            { userId: params.userId, businessId: params.businessId },
+            { p256dh: params.p256dh, auth: params.auth },
+          ],
+        },
+        update: {
+          p256dh: params.p256dh,
+          auth: params.auth,
+          userId: params.userId,
+          businessId: params.businessId,
+        },
+        create: {
+          businessId: params.businessId,
+          userId: params.userId,
+          endpoint: params.endpoint,
+          p256dh: params.p256dh,
+          auth: params.auth,
+        },
+        select: {
+          id: true,
+          businessId: true,
+          userId: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      });
+    } catch (error) {
+      // A nonmatching owner/proof makes upsert attempt a duplicate endpoint.
+      if ((error as { code?: string })?.code === 'P2002') {
+        throw new ConflictException('Não foi possível associar esta inscrição.');
+      }
+      throw error;
+    }
   }
 
   async removeSubscription(endpoint: string, userId: string, businessId: string) {
@@ -73,6 +97,16 @@ export class PushNotificationsService {
     body: string;
     url?: string;
   }) {
+    const recipient = await this.prisma.user.findFirst({
+      where: {
+        id: params.userId, businessId: params.businessId,
+        isActive: true, deletedAt: null,
+        business: { isActive: true, deletedAt: null },
+      },
+      select: { id: true },
+    });
+    if (!recipient) return;
+
     const subscriptions = await this.prisma.pushSubscription.findMany({
       where: {
         userId: params.userId,

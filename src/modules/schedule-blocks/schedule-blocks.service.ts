@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateScheduleBlockDto } from './dto/create-schedule-block.dto';
+import { UpdateScheduleBlockDto } from './dto/update-schedule-block.dto';
 
 @Injectable()
 export class ScheduleBlocksService {
@@ -65,19 +66,28 @@ export class ScheduleBlocksService {
   async updateScheduleBlock(
     blockId: string,
     businessId: string,
-    updateData: any,
+    updateData: UpdateScheduleBlockDto,
   ) {
     const block = await this.prisma.scheduleBlock.findUnique({
       where: { id: blockId },
     });
 
-    if (!block || block.businessId !== businessId) {
+    if (!block || block.businessId !== businessId || block.deletedAt) {
       throw new NotFoundException('Bloqueio não encontrado');
     }
 
     return this.prisma.scheduleBlock.update({
-      where: { id: blockId },
-      data: updateData,
+      where: { id: blockId, businessId, deletedAt: null },
+      data: {
+        type: updateData.type,
+        startAt: updateData.startAt,
+        endAt: updateData.endAt,
+        reason: updateData.reason,
+        isRecurring: updateData.isRecurring,
+        recurringDays: updateData.recurringDays,
+        recurringEndDate: updateData.recurringEndDate,
+        isActive: updateData.isActive,
+      },
     });
   }
 
@@ -86,12 +96,12 @@ export class ScheduleBlocksService {
       where: { id: blockId },
     });
 
-    if (!block || block.businessId !== businessId) {
+    if (!block || block.businessId !== businessId || block.deletedAt) {
       throw new NotFoundException('Bloqueio não encontrado');
     }
 
     return this.prisma.scheduleBlock.update({
-      where: { id: blockId },
+      where: { id: blockId, businessId, deletedAt: null },
       data: { deletedAt: new Date() },
     });
   }

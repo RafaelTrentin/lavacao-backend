@@ -13,6 +13,7 @@ import { AdminGuard } from 'src/common/guards/admin.guard';
 import { CurrentUser, CurrentUserPayload } from 'src/common/decorators/current-user.decorator';
 import { ScheduleBlocksService } from './schedule-blocks.service';
 import { CreateScheduleBlockDto } from './dto/create-schedule-block.dto';
+import { UpdateScheduleBlockDto } from './dto/update-schedule-block.dto';
 
 @Controller('admin/schedule-blocks')
 @UseGuards(JwtGuard, AdminGuard)
@@ -40,7 +41,7 @@ export class ScheduleBlocksController {
   @Put(':id')
   async update(
     @Param('id') blockId: string,
-    @Body() updateData: any,
+    @Body() updateData: UpdateScheduleBlockDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
     return this.scheduleBlocksService.updateScheduleBlock(
