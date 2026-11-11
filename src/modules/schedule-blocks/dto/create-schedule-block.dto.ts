@@ -5,37 +5,62 @@ import {
   IsOptional,
   IsBoolean,
   IsArray,
+  ArrayMaxSize,
+  ArrayUnique,
+  Matches,
+  ValidateIf,
 } from 'class-validator';
-import { ScheduleBlockType } from 'src/common/enums';
+import { Transform } from 'class-transformer';
+import { DayOfWeek, ScheduleBlockType } from 'src/common/enums';
+
+export const trimString = ({ value }: { value: unknown }) => typeof value === 'string' ? value.trim() : value;
+export const normalizeDays = ({ value }: { value: unknown }) => Array.isArray(value)
+  ? value.map((day) => typeof day === 'string' ? day.trim().toUpperCase() : day) : value;
 
 export class CreateScheduleBlockDto {
   @IsEnum(ScheduleBlockType)
   type: ScheduleBlockType;
 
-  @IsDateString()
+  @Transform(trimString)
+  @IsDateString({ strict: true })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
   blockDate: string;
 
-  @IsOptional()
-  @IsString()
+  @ValidateIf((_dto, value) => value !== undefined)
+  @Transform(trimString)
+  @IsDateString({ strict: true })
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  blockEndDate?: string;
+
+  @ValidateIf((dto, value) => dto.type === ScheduleBlockType.TIME_RANGE || value !== undefined)
+  @Transform(trimString)
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/)
   blockStartTime?: string;
 
-  @IsOptional()
-  @IsString()
+  @ValidateIf((dto, value) => dto.type === ScheduleBlockType.TIME_RANGE || value !== undefined)
+  @Transform(trimString)
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/)
   blockEndTime?: string;
 
   @IsOptional()
+  @Transform(trimString)
   @IsString()
   reason?: string;
 
-  @IsOptional()
+  @ValidateIf((_dto, value) => value !== undefined)
   @IsBoolean()
   isRecurring?: boolean;
 
   @IsOptional()
+  @Transform(normalizeDays)
   @IsArray()
-  recurringDays?: string[];
+  @ArrayMaxSize(7)
+  @ArrayUnique()
+  @IsEnum(DayOfWeek, { each: true })
+  recurringDays?: DayOfWeek[];
 
   @IsOptional()
-  @IsDateString()
+  @Transform(trimString)
+  @IsDateString({ strict: true })
   recurringEndDate?: string;
 }

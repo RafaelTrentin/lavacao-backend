@@ -1,6 +1,8 @@
-import { IsDateString, IsString } from 'class-validator';
+import { IsDateString, IsString, IsOptional, IsIn } from 'class-validator';
 
 export class GetAvailableSlotsDto {
+  @IsOptional() @IsIn(['true'])
+  includeStatus?: string;
   @IsDateString()
   date: string;
 

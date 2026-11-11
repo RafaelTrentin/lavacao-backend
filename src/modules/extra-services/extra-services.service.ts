@@ -40,9 +40,10 @@ export class ExtraServicesService {
       data: {
         businessId,
         displayOrder: (lastService?.displayOrder || 0) + 1,
-        estimatedPriceInCents: 0,
-        isActive: true,
-        ...createExtraServiceDto,
+        estimatedPriceInCents: createExtraServiceDto.estimatedPriceInCents === undefined ? 0 : createExtraServiceDto.estimatedPriceInCents,
+        isActive: createExtraServiceDto.isActive === undefined ? true : createExtraServiceDto.isActive,
+        description: createExtraServiceDto.description,
+        imageUrl: createExtraServiceDto.imageUrl,
         name: normalizedName,
       },
     });
@@ -77,10 +78,13 @@ export class ExtraServicesService {
     }
 
     return this.prisma.extraService.update({
-      where: { id: serviceId },
+      where: { id: serviceId, businessId, deletedAt: null },
       data: {
-        ...updateData,
-        ...(updateData.name ? { name: updateData.name.trim() } : {}),
+        name: updateData.name === undefined ? undefined : updateData.name?.trim(),
+        description: updateData.description,
+        imageUrl: updateData.imageUrl,
+        estimatedPriceInCents: updateData.estimatedPriceInCents,
+        isActive: updateData.isActive,
       },
     });
   }
@@ -95,7 +99,7 @@ export class ExtraServicesService {
     }
 
     return this.prisma.extraService.update({
-      where: { id: serviceId },
+      where: { id: serviceId, businessId, deletedAt: null },
       data: { deletedAt: new Date() },
     });
   }
@@ -139,7 +143,7 @@ export class ExtraServicesService {
         businessId,
         customerId,
         extraServiceId,
-        ...createRequestDto,
+        description: createRequestDto.description,
       },
     });
   }
@@ -171,7 +175,7 @@ export class ExtraServicesService {
     }
 
     return this.prisma.extraServiceRequest.update({
-      where: { id: requestId },
+      where: { id: requestId, businessId },
       data: { status: status as ExtraServiceRequestStatus },
     });
   }

@@ -1,3 +1,4 @@
+import { UnsubscribePushDto } from './dto/unsubscribe-push.dto';
 import { Body, Controller, Delete, Get, Post, UseGuards } from '@nestjs/common';
 import { JwtGuard } from 'src/common/guards/jwt.guard';
 import {
@@ -40,7 +41,7 @@ export class PushNotificationsController {
 
   @Delete('unsubscribe')
   async unsubscribe(
-    @Body() body: { endpoint: string },
+    @Body() body: UnsubscribePushDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
     return this.pushNotificationsService.removeSubscription(

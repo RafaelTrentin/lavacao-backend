@@ -1,3 +1,4 @@
+import { businessTimezone, civilDate, dayBounds, localParts, notificationDate, utcInstant } from '../../common/business-time';
 import {
   Injectable,
   BadRequestException,
@@ -10,7 +11,11 @@ import {
   AppointmentStatus,
   SearchType,
   NotificationType,
+  Notification,
+  Appointment,
 } from '@prisma/client';
+import { withScheduleTransaction } from './schedule-transaction';
+import { searchFeePolicy } from './search-fee-policy';
 import { PrismaService } from '../prisma/prisma.service';
 import { AvailabilityService } from '../availability/availability.service';
 import { MapsService } from '../maps/maps.service';
@@ -30,66 +35,47 @@ export class AppointmentsService {
     private pushNotificationsService: PushNotificationsService,
   ) {}
 
-private async notifyAdminsAboutNewAppointment(
-  businessId: string,
-  appointmentId: string,
-  bookingNumber: string,
-): Promise<void> {
-  try {
-    const admins = await this.prisma.user.findMany({
-      where: {
-        businessId,
-        role: 'ADMIN',
-        isActive: true,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-      },
+  private async recordAdminNotifications(tx: Prisma.TransactionClient, appointment: Appointment): Promise<Notification[]> {
+    const admins = await tx.user.findMany({
+      where: { businessId: appointment.businessId, role: 'ADMIN', isActive: true, deletedAt: null },
+      select: { id: true },
     });
-
-    const title = 'Novo agendamento recebido';
-    const message = `Um cliente realizou o agendamento #${bookingNumber}.`;
-
-    const results = await Promise.allSettled(
-      admins.map(async (admin) => {
-        await this.notificationsService.createForUser({
-          businessId,
-          userId: admin.id,
-          appointmentId,
-          type: NotificationType.GENERAL,
-          title,
-          message,
-        });
-
-        await this.pushNotificationsService.sendToUser({
-          businessId,
-          userId: admin.id,
-          title,
-          body: message,
-          url: '/notifications',
-        });
-      }),
-    );
-
-    results.forEach((result, index) => {
-      if (result.status === 'rejected') {
-        this.logger.error(
-          `Falha ao notificar administrador ${admins[index].id}`,
-          result.reason instanceof Error
-            ? result.reason.stack
-            : String(result.reason),
-        );
-      }
-    });
-  } catch (error) {
-    this.logger.error(
-      `Falha ao preparar notificações do agendamento ${appointmentId}`,
-      error instanceof Error ? error.stack : String(error),
-    );
+    return Promise.all(admins.map((admin) => this.notificationsService.createForUser({
+      businessId: appointment.businessId, userId: admin.id, appointmentId: appointment.id,
+      type: NotificationType.GENERAL, title: 'Novo agendamento recebido',
+      message: `Um cliente realizou o agendamento #${appointment.bookingNumber}.`,
+    }, tx)));
   }
-}
 
+  /** Best-effort dispatch, only after the transaction promise has committed.
+   * No queue, no automatic retry, and no provider latency on the HTTP response.
+   * Internal Notification rows remain available even if this process stops here.
+   */
+  private dispatchAfterCommit(events: Notification[], snapshot: Appointment): void {
+    for (const event of events) {
+      void this.dispatchCommittedEvent(event, snapshot).catch(() => {
+        // Provider errors may contain tokens/endpoints. Log only our event ID.
+        this.logger.warn(`Falha ao entregar push da notificacao ${event.id}`);
+      });
+    }
+  }
+
+  private async dispatchCommittedEvent(event: Notification, snapshot: Appointment): Promise<void> {
+    const current = await this.prisma.appointment.findFirst({
+      where: {
+        id: snapshot.id, businessId: event.businessId, deletedAt: null,
+        status: snapshot.status, scheduledStartAt: snapshot.scheduledStartAt,
+        confirmedAt: snapshot.confirmedAt, modifiedAt: snapshot.modifiedAt,
+        cancelledAt: snapshot.cancelledAt, completedAt: snapshot.completedAt,
+      }, select: { id: true },
+    });
+    // A later committed transition may already have superseded this message.
+    if (!current) return;
+    await this.pushNotificationsService.sendToUser({
+      businessId: event.businessId, userId: event.userId, title: event.title,
+      body: event.message, url: '/notifications',
+    });
+  }
 
   async createAppointment(
     businessId: string,
@@ -122,7 +108,7 @@ private async notifyAdminsAboutNewAppointment(
       throw new BadRequestException('Data e hora são obrigatórios');
     }
 
-    const scheduledDate = new Date(scheduledStartAt);
+    const scheduledDate = utcInstant(scheduledStartAt);
     if (isNaN(scheduledDate.getTime())) {
       throw new BadRequestException('Data/hora inválida');
     }
@@ -178,6 +164,10 @@ private async notifyAdminsAboutNewAppointment(
     );
   }
 
+  if (![SearchType.CURRENT_LOCATION, SearchType.MANUAL_ADDRESS].includes(searchType as SearchType)) {
+    throw new BadRequestException('Tipo de busca inválido');
+  }
+
   if (searchType === SearchType.CURRENT_LOCATION) {
     const estimate = await this.estimateSearchFee(businessId, customerId, {
       serviceModeId,
@@ -195,6 +185,7 @@ private async notifyAdminsAboutNewAppointment(
   }
 
   if (searchType === SearchType.MANUAL_ADDRESS) {
+    // No automatic charge, even if an address has coordinates. Negotiated offline.
     calculatedDistanceKm = 0;
     searchFeeInCents = 0;
   }
@@ -248,6 +239,7 @@ private async notifyAdminsAboutNewAppointment(
             label: savedAddress.label,
           };
         } else {
+          this.validateManualPickupAddress({ streetAddress, city, state });
           selectedAddress = {
   streetAddress: streetAddress || '',
   number: number || '',
@@ -265,20 +257,6 @@ private async notifyAdminsAboutNewAppointment(
       }
     }
 
-    const isAvailable = await this.availabilityService.validateSlotAvailability(
-      businessId,
-      scheduledDate,
-      this.formatTime(scheduledDate),
-      vehicleType,
-      serviceModeId,
-    );
-
-    if (!isAvailable) {
-      throw new BadRequestException(
-        'Horário não está mais disponível. Por favor, escolha outro.',
-      );
-    }
-
     const durationMinutes = serviceRule.durationMinutes;
     const scheduledEndAt = new Date(
       scheduledDate.getTime() + durationMinutes * 60000,
@@ -289,8 +267,24 @@ private async notifyAdminsAboutNewAppointment(
 
     const bookingNumber = this.generateBookingNumber();
 
-    const appointment = await this.prisma.$transaction(
+    const { appointment, events } = await withScheduleTransaction(this.prisma, businessId,
       async (tx) => {
+        const isAvailable = await this.availabilityService.validateSlotAvailability(
+          businessId,
+          scheduledDate,
+          '',
+          vehicleType,
+          serviceModeId,
+          { tx, durationMinutes, exactStart: true },
+        );
+
+        if (!isAvailable) {
+          throw new BadRequestException(
+            'Horário não está mais disponível. Por favor, escolha outro.',
+          );
+        }
+
+
         const conflicting = await tx.appointment.findMany({
           where: {
             businessId,
@@ -326,7 +320,7 @@ private async notifyAdminsAboutNewAppointment(
             willSearchVehicle,
             searchType: willSearchVehicle ? searchType : null,
             snapshotSearchFeeInCents: searchFeeInCents,
-            snapshotDistanceKm: willSearchVehicle
+            snapshotDistanceKm: willSearchVehicle && searchType === SearchType.CURRENT_LOCATION
               ? new Prisma.Decimal(calculatedDistanceKm)
               : null,
 
@@ -366,18 +360,12 @@ private async notifyAdminsAboutNewAppointment(
           },
         });
 
-        return newAppointment;
-      },
-      {
-        timeout: 10000,
+        const events = await this.recordAdminNotifications(tx, newAppointment);
+        return { appointment: newAppointment, events };
       },
     );
 
-    await this.notifyAdminsAboutNewAppointment(
-      businessId,
-      appointment.id,
-      appointment.bookingNumber,
-    );
+    this.dispatchAfterCommit(events, appointment);
 
     return this.serializeAppointment(appointment);
   }
@@ -389,31 +377,31 @@ private async notifyAdminsAboutNewAppointment(
     userRole: string,
     reason?: string,
   ) {
-    const appointment = await this.getAppointmentById(appointmentId, businessId);
+    const { updated, events } = await withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const appointment = await this.getAppointmentById(appointmentId, businessId, tx);
 
-    if (userRole === 'CUSTOMER') {
-      const customer = await this.prisma.customerProfile.findUnique({
-        where: { userId },
-      });
+      if (userRole === 'CUSTOMER') {
+        const customer = await tx.customerProfile.findUnique({
+          where: { userId },
+        });
 
-      if (!customer || appointment.customerId !== customer.id) {
+        if (!customer || appointment.customerId !== customer.id) {
+          throw new BadRequestException(
+            'Você não pode cancelar este agendamento',
+          );
+        }
+      }
+
+      if (appointment.status !== AppointmentStatus.CONFIRMED) {
         throw new BadRequestException(
-          'Você não pode cancelar este agendamento',
+          'Apenas agendamentos confirmados podem ser cancelados',
         );
       }
-    }
 
-    if (appointment.status !== AppointmentStatus.CONFIRMED) {
-      throw new BadRequestException(
-        'Apenas agendamentos confirmados podem ser cancelados',
-      );
-    }
-
-    return this.prisma.$transaction(async (tx) => {
       const oldStatus = appointment.status;
 
       const updated = await tx.appointment.update({
-        where: { id: appointmentId },
+        where: { id: appointmentId, businessId, deletedAt: null },
         data: {
           status: AppointmentStatus.CANCELLED,
           cancelledAt: new Date(),
@@ -429,25 +417,19 @@ private async notifyAdminsAboutNewAppointment(
         },
       });
 
-      await this.notificationsService.createForUser({
+      const event = await this.notificationsService.createForUser({
         businessId,
         userId: appointment.customer.userId,
         appointmentId: appointment.id,
         type: NotificationType.APPOINTMENT_CANCELLED,
         title: 'Agendamento cancelado',
         message: `Seu agendamento #${appointment.bookingNumber} foi cancelado.`,
-      });
-
-      await this.pushNotificationsService.sendToUser({
-        userId: appointment.customer.userId,
-        businessId,
-        title: 'Agendamento cancelado',
-        body: `Seu agendamento #${appointment.bookingNumber} foi cancelado.`,
-        url: '/notifications',
-      });
-
-      return updated;
+      }, tx);
+      return { updated, events: [event] };
     });
+
+    this.dispatchAfterCommit(events, updated);
+    return { ...updated, ...searchFeePolicy(updated) };
   }
 
   async rescheduleAppointment(
@@ -456,41 +438,48 @@ private async notifyAdminsAboutNewAppointment(
     newScheduledStartAt: Date,
     adminId?: string,
   ) {
-    const appointment = await this.getAppointmentById(appointmentId, businessId);
+    const { updated, events } = await withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const appointment = await this.getAppointmentById(appointmentId, businessId, tx);
 
-    const reschedulableStatuses: AppointmentStatus[] = [
-      AppointmentStatus.CONFIRMED,
-      AppointmentStatus.NO_SHOW,
-    ];
+      const reschedulableStatuses: AppointmentStatus[] = [
+        AppointmentStatus.CONFIRMED,
+        AppointmentStatus.NO_SHOW,
+      ];
 
-    if (!reschedulableStatuses.includes(appointment.status)) {
-      throw new BadRequestException(
-        `Agendamento com status ${appointment.status} não pode ser reagendado`,
+      if (!reschedulableStatuses.includes(appointment.status)) {
+        throw new BadRequestException(
+          `Agendamento com status ${appointment.status} não pode ser reagendado`,
+        );
+      }
+
+      if (appointment.status === AppointmentStatus.CONFIRMED &&
+          appointment.scheduledStartAt.getTime() === newScheduledStartAt.getTime()) {
+        const updated = await tx.appointment.findUnique({ where: { id: appointmentId, businessId, deletedAt: null } });
+        return { updated, events: [] as Notification[] };
+      }
+
+      const isAvailable = await this.availabilityService.validateSlotAvailability(
+        businessId,
+        newScheduledStartAt,
+        '',
+        appointment.vehicleType as any,
+        appointment.serviceModeId,
+        { tx, durationMinutes: appointment.snapshotDurationMinutes, excludeAppointmentId: appointment.id, exactStart: true },
       );
-    }
 
-    const isAvailable = await this.availabilityService.validateSlotAvailability(
-      businessId,
-      newScheduledStartAt,
-      this.formatTime(newScheduledStartAt),
-      appointment.vehicleType as any,
-      appointment.serviceModeId,
-    );
+      if (!isAvailable) {
+        throw new BadRequestException('Novo horário não está disponível');
+      }
 
-    if (!isAvailable) {
-      throw new BadRequestException('Novo horário não está disponível');
-    }
+      const newScheduledEndAt = new Date(
+        newScheduledStartAt.getTime() +
+          appointment.snapshotDurationMinutes * 60000,
+      );
 
-    const newScheduledEndAt = new Date(
-      newScheduledStartAt.getTime() +
-        appointment.snapshotDurationMinutes * 60000,
-    );
-
-    return this.prisma.$transaction(async (tx) => {
       const oldStatus = appointment.status;
 
       const updated = await tx.appointment.update({
-        where: { id: appointmentId },
+        where: { id: appointmentId, businessId, deletedAt: null },
         data: {
           scheduledStartAt: newScheduledStartAt,
           scheduledEndAt: newScheduledEndAt,
@@ -512,25 +501,21 @@ private async notifyAdminsAboutNewAppointment(
         },
       });
 
-      await this.notificationsService.createForUser({
+      const business = await tx.business.findUnique({ where: { id: businessId }, select: { timezone: true } });
+      const timezone = businessTimezone(business?.timezone);
+      const event = await this.notificationsService.createForUser({
         businessId,
         userId: appointment.customer.userId,
         appointmentId: appointment.id,
         type: NotificationType.APPOINTMENT_RESCHEDULED,
         title: 'Agendamento reagendado',
-        message: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${this.formatNotificationDate(newScheduledStartAt)}.`,
-      });
-
-      await this.pushNotificationsService.sendToUser({
-        userId: appointment.customer.userId,
-        businessId,
-        title: 'Agendamento reagendado',
-        body: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${this.formatNotificationDate(newScheduledStartAt)}.`,
-        url: '/notifications',
-      });
-
-      return updated;
+        message: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${notificationDate(newScheduledStartAt, timezone)}.`,
+      }, tx);
+      return { updated, events: [event] };
     });
+
+    this.dispatchAfterCommit(events, updated);
+    return { ...updated, ...searchFeePolicy(updated) };
   }
 
   async rescheduleCustomerAppointment(
@@ -539,45 +524,53 @@ private async notifyAdminsAboutNewAppointment(
     customerId: string,
     newScheduledStartAt: Date,
   ) {
-    const appointment = await this.getCustomerAppointmentById(
-      appointmentId,
-      businessId,
-      customerId,
-    );
-
-    const reschedulableStatuses: AppointmentStatus[] = [
-      AppointmentStatus.CONFIRMED,
-      AppointmentStatus.NO_SHOW,
-    ];
-
-    if (!reschedulableStatuses.includes(appointment.status)) {
-      throw new BadRequestException(
-        `Agendamento com status ${appointment.status} não pode ser reagendado`,
+    const { updated, events } = await withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const appointment = await this.getCustomerAppointmentById(
+        appointmentId,
+        businessId,
+        customerId,
+        tx,
       );
-    }
 
-    const isAvailable = await this.availabilityService.validateSlotAvailability(
-      businessId,
-      newScheduledStartAt,
-      this.formatTime(newScheduledStartAt),
-      appointment.vehicleType as any,
-      appointment.serviceModeId,
-    );
+      const reschedulableStatuses: AppointmentStatus[] = [
+        AppointmentStatus.CONFIRMED,
+        AppointmentStatus.NO_SHOW,
+      ];
 
-    if (!isAvailable) {
-      throw new BadRequestException('Novo horário não está disponível');
-    }
+      if (!reschedulableStatuses.includes(appointment.status)) {
+        throw new BadRequestException(
+          `Agendamento com status ${appointment.status} não pode ser reagendado`,
+        );
+      }
 
-    const newScheduledEndAt = new Date(
-      newScheduledStartAt.getTime() +
-        appointment.snapshotDurationMinutes * 60000,
-    );
+      if (appointment.status === AppointmentStatus.CONFIRMED &&
+          appointment.scheduledStartAt.getTime() === newScheduledStartAt.getTime()) {
+        const updated = await tx.appointment.findUnique({ where: { id: appointmentId, businessId, deletedAt: null } });
+        return { updated, events: [] as Notification[] };
+      }
 
-    return this.prisma.$transaction(async (tx) => {
+      const isAvailable = await this.availabilityService.validateSlotAvailability(
+        businessId,
+        newScheduledStartAt,
+        '',
+        appointment.vehicleType as any,
+        appointment.serviceModeId,
+        { tx, durationMinutes: appointment.snapshotDurationMinutes, excludeAppointmentId: appointment.id, exactStart: true },
+      );
+
+      if (!isAvailable) {
+        throw new BadRequestException('Novo horário não está disponível');
+      }
+
+      const newScheduledEndAt = new Date(
+        newScheduledStartAt.getTime() +
+          appointment.snapshotDurationMinutes * 60000,
+      );
+
       const oldStatus = appointment.status;
 
       const updated = await tx.appointment.update({
-        where: { id: appointmentId },
+        where: { id: appointmentId, businessId, deletedAt: null },
         data: {
           scheduledStartAt: newScheduledStartAt,
           scheduledEndAt: newScheduledEndAt,
@@ -595,25 +588,21 @@ private async notifyAdminsAboutNewAppointment(
         },
       });
 
-      await this.notificationsService.createForUser({
+      const business = await tx.business.findUnique({ where: { id: businessId }, select: { timezone: true } });
+      const timezone = businessTimezone(business?.timezone);
+      const event = await this.notificationsService.createForUser({
         businessId,
         userId: appointment.customer.userId,
         appointmentId: appointment.id,
         type: NotificationType.APPOINTMENT_RESCHEDULED,
         title: 'Agendamento reagendado',
-        message: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${this.formatNotificationDate(newScheduledStartAt)}.`,
-      });
-
-      await this.pushNotificationsService.sendToUser({
-        userId: appointment.customer.userId,
-        businessId,
-        title: 'Agendamento reagendado',
-        body: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${this.formatNotificationDate(newScheduledStartAt)}.`,
-        url: '/notifications',
-      });
-
-      return updated;
+        message: `Seu agendamento #${appointment.bookingNumber} foi reagendado para ${notificationDate(newScheduledStartAt, timezone)}.`,
+      }, tx);
+      return { updated, events: [event] };
     });
+
+    this.dispatchAfterCommit(events, updated);
+    return { ...updated, ...searchFeePolicy(updated) };
   }
 
   async startAppointment(
@@ -621,17 +610,18 @@ private async notifyAdminsAboutNewAppointment(
     businessId: string,
     adminId: string,
   ) {
-    const appointment = await this.getAppointmentById(appointmentId, businessId);
+    const { updated, events } = await withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const appointment = await this.getAppointmentById(appointmentId, businessId, tx);
 
-    if (appointment.status !== AppointmentStatus.CONFIRMED) {
-      throw new BadRequestException(
-        'Apenas agendamentos confirmados podem iniciar',
-      );
-    }
+      if (appointment.status !== AppointmentStatus.CONFIRMED) {
+        throw new BadRequestException(
+          'Apenas agendamentos confirmados podem iniciar',
+        );
+      }
 
-    return this.prisma.$transaction(async (tx) => {
+
       const updated = await tx.appointment.update({
-        where: { id: appointmentId },
+        where: { id: appointmentId, businessId, deletedAt: null },
         data: {
           status: AppointmentStatus.IN_PROGRESS,
           modifiedByAdminId: adminId,
@@ -648,47 +638,42 @@ private async notifyAdminsAboutNewAppointment(
         },
       });
 
-      await this.notificationsService.createForUser({
+      const event = await this.notificationsService.createForUser({
         businessId,
         userId: appointment.customer.userId,
         appointmentId: appointment.id,
         type: NotificationType.APPOINTMENT_STARTED,
         title: 'Atendimento iniciado',
         message: `Seu veículo entrou em atendimento no agendamento #${appointment.bookingNumber}.`,
-      });
-
-      await this.pushNotificationsService.sendToUser({
-        userId: appointment.customer.userId,
-        businessId,
-        title: 'Atendimento iniciado',
-        body: `Seu veículo entrou em atendimento no agendamento #${appointment.bookingNumber}.`,
-        url: '/notifications',
-      });
-
-      return updated;
+      }, tx);
+      return { updated, events: [event] };
     });
-  }
 
+    this.dispatchAfterCommit(events, updated);
+    return { ...updated, ...searchFeePolicy(updated) };
+  }
 
 async completeAppointment(
   appointmentId: string,
   businessId: string,
   adminId: string,
 ) {
-  const appointment = await this.getAppointmentById(
-    appointmentId,
-    businessId,
-  );
-
-  if (appointment.status !== AppointmentStatus.IN_PROGRESS) {
-    throw new BadRequestException(
-      'Apenas agendamentos em andamento podem ser concluídos',
+  const { updated, events } = await withScheduleTransaction(this.prisma, businessId, async (tx) => {
+    const appointment = await this.getAppointmentById(
+      appointmentId,
+      businessId,
+      tx,
     );
-  }
 
-  const updated = await this.prisma.$transaction(async (tx) => {
+    if (appointment.status !== AppointmentStatus.IN_PROGRESS) {
+      throw new BadRequestException(
+        'Apenas agendamentos em andamento podem ser concluídos',
+      );
+    }
+
+
     const result = await tx.appointment.update({
-      where: { id: appointmentId },
+      where: { id: appointmentId, businessId, deletedAt: null },
       data: {
         status: AppointmentStatus.COMPLETED,
         completedAt: new Date(),
@@ -706,53 +691,28 @@ async completeAppointment(
       },
     });
 
-    return result;
-  });
-
-  // A transação já foi concluída.
-  // Uma falha na notificação não desfaz a conclusão do serviço.
   const title = 'Seu veículo está pronto!';
   const message =
     `O atendimento do seu agendamento #${appointment.bookingNumber} ` +
     'foi concluído. Obrigado por escolher nossa lavação!';
 
-  try {
-    await this.notificationsService.createForUser({
+    const event = await this.notificationsService.createForUser({
       businessId,
       userId: appointment.customer.userId,
       appointmentId: appointment.id,
       type: NotificationType.GENERAL,
       title,
       message,
-    });
-  } catch (error) {
-    this.logger.error(
-      `Falha ao registrar notificação de conclusão ${appointmentId}`,
-      error instanceof Error ? error.stack : String(error),
-    );
-  }
+    }, tx);
+    return { updated: result, events: [event] };
+  });
 
-  try {
-    await this.pushNotificationsService.sendToUser({
-      businessId,
-      userId: appointment.customer.userId,
-      title,
-      body: message,
-      url: '/notifications',
-    });
-  } catch (error) {
-    this.logger.error(
-      `Falha ao enviar push de conclusão ${appointmentId}`,
-      error instanceof Error ? error.stack : String(error),
-    );
-  }
-
-  return updated;
+  this.dispatchAfterCommit(events, updated);
+  return { ...updated, ...searchFeePolicy(updated) };
 }
 
-
   async getCustomerAppointments(customerId: string, businessId: string) {
-    return this.prisma.appointment.findMany({
+    const appointments = await this.prisma.appointment.findMany({
       where: {
         customerId,
         businessId,
@@ -765,18 +725,20 @@ async completeAppointment(
       },
       orderBy: { scheduledStartAt: 'desc' },
     });
+    return appointments.map((appointment) => ({ ...appointment, ...searchFeePolicy(appointment) }));
   }
 
-  async getAppointmentsByDate(businessId: string, date: Date) {
-    const startOfDay = new Date(date);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(date);
-    endOfDay.setHours(23, 59, 59, 999);
+  async getAppointmentsByDate(businessId: string, date: string | Date) {
+    const business = await this.prisma.business.findUnique({ where: { id: businessId }, select: { timezone: true } });
+    if (!business) throw new NotFoundException('Empresa nao encontrada');
+    const zone = businessTimezone(business.timezone);
+    const dateKey = typeof date === 'string' ? civilDate(date) : localParts(date, zone).date;
+    const { start: startOfDay, end: endOfDay } = dayBounds(dateKey, zone);
 
-    return this.prisma.appointment.findMany({
+    const appointments = await this.prisma.appointment.findMany({
       where: {
         businessId,
-        scheduledStartAt: { gte: startOfDay, lte: endOfDay },
+        scheduledStartAt: { gte: startOfDay, lt: endOfDay },
         deletedAt: null,
       },
       include: {
@@ -785,10 +747,11 @@ async completeAppointment(
       },
       orderBy: { scheduledStartAt: 'asc' },
     });
+    return appointments.map((appointment) => ({ ...appointment, ...searchFeePolicy(appointment) }));
   }
 
-  async getAppointmentById(appointmentId: string, businessId: string) {
-    const appointment = await this.prisma.appointment.findUnique({
+  async getAppointmentById(appointmentId: string, businessId: string, db: Prisma.TransactionClient = this.prisma) {
+    const appointment = await db.appointment.findUnique({
       where: { id: appointmentId },
       include: {
         customer: true,
@@ -801,15 +764,16 @@ async completeAppointment(
       throw new NotFoundException('Agendamento não encontrado');
     }
 
-    return appointment;
+    return { ...appointment, ...searchFeePolicy(appointment) };
   }
 
   async getCustomerAppointmentById(
     appointmentId: string,
     businessId: string,
     customerId: string,
+    db: Prisma.TransactionClient = this.prisma,
   ) {
-    const appointment = await this.prisma.appointment.findUnique({
+    const appointment = await db.appointment.findUnique({
       where: { id: appointmentId },
       include: {
         customer: true,
@@ -827,19 +791,13 @@ async completeAppointment(
       throw new NotFoundException('Agendamento não encontrado');
     }
 
-    return appointment;
+    return { ...appointment, ...searchFeePolicy(appointment) };
   }
 
   private generateBookingNumber(): string {
     const timestamp = Date.now().toString(36).toUpperCase();
     const random = Math.random().toString(36).substring(2, 8).toUpperCase();
     return `${timestamp}${random}`;
-  }
-
-  private formatTime(date: Date): string {
-    const hours = String(date.getHours()).padStart(2, '0');
-    const minutes = String(date.getMinutes()).padStart(2, '0');
-    return `${hours}:${minutes}`;
   }
 
   private serializeAppointment(
@@ -851,6 +809,7 @@ async completeAppointment(
     }>,
   ) {
     return {
+      ...searchFeePolicy(appointment),
       id: appointment.id,
       bookingNumber: appointment.bookingNumber,
       status: appointment.status,
@@ -860,6 +819,7 @@ async completeAppointment(
       snapshotTotalPriceInCents: appointment.snapshotTotalPriceInCents,
       vehicleType: appointment.vehicleType,
       willSearchVehicle: appointment.willSearchVehicle,
+      searchType: appointment.searchType,
       createdAt: appointment.createdAt,
     };
   }
@@ -929,51 +889,11 @@ async completeAppointment(
     return earthRadiusKm * c;
   }
 
-  private async resolveAddressCoordinatesFromManualAddress(data: {
-    streetAddress: string;
-    number?: string;
-    neighborhood?: string;
-    city: string;
-    state: string;
-    zipCode?: string;
-    latitude?: number;
-    longitude?: number;
-  }) {
-    if (
-      typeof data.latitude === 'number' &&
-      typeof data.longitude === 'number'
-    ) {
-      return {
-        latitude: data.latitude,
-        longitude: data.longitude,
-      };
-    }
-
-    const geo = await this.mapsService.geocodeAddress({
-      streetAddress: data.streetAddress,
-      number: data.number || '',
-      neighborhood: data.neighborhood || '',
-      city: data.city,
-      state: data.state,
-      zipCode: data.zipCode || '',
-    });
-
-    return {
-      latitude: geo.latitude,
-      longitude: geo.longitude,
-    };
-  }
-
   async estimateSearchFee(
     businessId: string,
     customerId: string,
     dto: EstimateSearchFeeDto,
   ) {
-    const {
-      latitude: businessLat,
-      longitude: businessLng,
-    } = await this.ensureBusinessCoordinates(businessId);
-
     const serviceRule = await this.prisma.serviceModeRule.findFirst({
       where: {
         serviceMode: { id: dto.serviceModeId, businessId, isActive: true, deletedAt: null },
@@ -989,6 +909,7 @@ async completeAppointment(
 
     if (!dto.willSearchVehicle) {
       return {
+        ...searchFeePolicy(dto),
         distanceKm: 0,
         searchFeeInCents: 0,
         basePriceInCents: serviceRule.basePriceInCents,
@@ -999,6 +920,25 @@ async completeAppointment(
     if (!dto.searchType) {
       throw new BadRequestException('searchType é obrigatório');
     }
+
+    if (dto.searchType === 'MANUAL_ADDRESS') {
+      if (dto.serviceAddressId) {
+        const address = await this.prisma.address.findUnique({ where: { id: dto.serviceAddressId } });
+        if (!address || address.deletedAt || address.businessId !== businessId || address.customerId !== customerId) {
+          throw new BadRequestException('Endereço inválido, não encontrado ou não autorizado');
+        }
+      } else {
+        this.validateManualPickupAddress(dto);
+      }
+      return {
+        ...searchFeePolicy(dto), distanceKm: null, searchFeeInCents: 0,
+        basePriceInCents: serviceRule.basePriceInCents, totalPriceInCents: serviceRule.basePriceInCents,
+      };
+    }
+    if (dto.searchType !== 'CURRENT_LOCATION') throw new BadRequestException('Tipo de busca inválido');
+    this.validatePickupCoordinates(dto.latitude, dto.longitude);
+    const { latitude: businessLat, longitude: businessLng } = await this.ensureBusinessCoordinates(businessId);
+    this.validatePickupCoordinates(businessLat, businessLng);
 
     let customerLat: number | null = null;
     let customerLng: number | null = null;
@@ -1015,70 +955,6 @@ async completeAppointment(
 
       customerLat = dto.latitude;
       customerLng = dto.longitude;
-    }
-
-    if (dto.searchType === 'MANUAL_ADDRESS') {
-      if (dto.serviceAddressId) {
-        const savedAddress = await this.prisma.address.findUnique({
-          where: { id: dto.serviceAddressId },
-        });
-
-        if (
-          !savedAddress ||
-          savedAddress.deletedAt ||
-          savedAddress.businessId !== businessId ||
-          savedAddress.customerId !== customerId
-        ) {
-          throw new BadRequestException(
-            'Endereço inválido, não encontrado ou não autorizado',
-          );
-        }
-
-        if (savedAddress.latitude && savedAddress.longitude) {
-          customerLat = savedAddress.latitude.toNumber();
-          customerLng = savedAddress.longitude.toNumber();
-        } else {
-          const geo = await this.mapsService.geocodeAddress({
-            streetAddress: savedAddress.streetAddress,
-            number: savedAddress.number || '',
-            neighborhood: savedAddress.neighborhood || '',
-            city: savedAddress.city,
-            state: savedAddress.state,
-            zipCode: savedAddress.zipCode || '',
-          });
-
-          customerLat = geo.latitude;
-          customerLng = geo.longitude;
-
-          await this.prisma.address.update({
-            where: { id: savedAddress.id },
-            data: {
-              latitude: new Prisma.Decimal(customerLat),
-              longitude: new Prisma.Decimal(customerLng),
-            },
-          });
-        }
-      } else {
-        if (!dto.streetAddress || !dto.city || !dto.state) {
-          throw new BadRequestException(
-            'Rua, cidade e estado são obrigatórios para endereço manual',
-          );
-        }
-
-        const geo = await this.resolveAddressCoordinatesFromManualAddress({
-          streetAddress: dto.streetAddress,
-          number: dto.number,
-          neighborhood: dto.neighborhood,
-          city: dto.city,
-          state: dto.state,
-          zipCode: dto.zipCode,
-          latitude: dto.latitude,
-          longitude: dto.longitude,
-        });
-
-        customerLat = geo.latitude;
-        customerLng = geo.longitude;
-      }
     }
 
     if (customerLat == null || customerLng == null) {
@@ -1111,6 +987,7 @@ async completeAppointment(
           : settings.searchFeeOver5km;
 
     return {
+      ...searchFeePolicy(dto),
       distanceKm: Number(distanceKm.toFixed(2)),
       searchFeeInCents,
       basePriceInCents: serviceRule.basePriceInCents,
@@ -1118,13 +995,17 @@ async completeAppointment(
     };
   }
 
-  private formatNotificationDate(date: Date) {
-    const day = String(date.getDate()).padStart(2, '0');
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const year = date.getFullYear();
-    const hours = String(date.getHours()).padStart(2, '0');
-    const minutes = String(date.getMinutes()).padStart(2, '0');
-
-    return `${day}/${month}/${year} às ${hours}:${minutes}`;
+  private validateManualPickupAddress(data: { streetAddress?: string; city?: string; state?: string }) {
+    if (![data.streetAddress, data.city, data.state].every((value) => typeof value === 'string' && value.trim())) {
+      throw new BadRequestException('Rua, cidade e estado são obrigatórios para endereço manual');
+    }
   }
+
+  private validatePickupCoordinates(latitude: unknown, longitude: unknown) {
+    if (typeof latitude !== 'number' || !Number.isFinite(latitude) || Math.abs(latitude) > 90 ||
+        typeof longitude !== 'number' || !Number.isFinite(longitude) || Math.abs(longitude) > 180) {
+      throw new BadRequestException('Latitude e longitude válidas são obrigatórias para localização atual');
+    }
+  }
+
 }

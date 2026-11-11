@@ -1,3 +1,4 @@
+import { UpdateServiceModeRuleDto } from './dto/update-service-mode-rule.dto';
 import {
   Controller,
   Get,
@@ -111,7 +112,7 @@ export class ServiceModesController {
   @UseGuards(JwtGuard, AdminGuard)
   async updateRule(
     @Param('ruleId') ruleId: string,
-    @Body() updateData: { durationMinutes: number; basePriceInCents: number },
+    @Body() updateData: UpdateServiceModeRuleDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
     return this.serviceModeService.updateServiceModeRule(

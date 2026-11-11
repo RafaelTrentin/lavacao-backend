@@ -9,6 +9,7 @@ import { CreateBusinessDto } from './dto/create-business.dto';
 import { UpdateBusinessSettingsDto } from './dto/update-business-settings.dto';
 import { MapsService } from '../maps/maps.service';
 import { GeocodeAddressDto } from '../maps/dto/geocode-address.dto';
+import { businessTimezone } from '../../common/business-time';
 
 type OperatingPeriod = {
   open: string;
@@ -167,7 +168,13 @@ async updateBusinessSettings(
 
     return this.prisma.businessBranding.update({
       where: { businessId },
-      data: updateBrandingData,
+      data: {
+        logoUrl: updateBrandingData.logoUrl,
+        iconUrl: updateBrandingData.iconUrl,
+        primaryColor: updateBrandingData.primaryColor,
+        secondaryColor: updateBrandingData.secondaryColor,
+        accentColor: updateBrandingData.accentColor,
+      },
     });
   }
 
@@ -194,7 +201,13 @@ async updateBusinessSettings(
     return this.prisma.businessAddress.update({
       where: { businessId },
       data: {
-        ...updateAddressData,
+        streetAddress: updateAddressData.streetAddress,
+        number: updateAddressData.number,
+        complement: updateAddressData.complement,
+        neighborhood: updateAddressData.neighborhood,
+        city: updateAddressData.city,
+        state: updateAddressData.state,
+        zipCode: updateAddressData.zipCode,
         ...(updateAddressData.latitude !== undefined && {
           latitude: new Prisma.Decimal(updateAddressData.latitude),
         }),
@@ -278,7 +291,7 @@ async updateBusinessSettings(
       data: {
         name,
         slug: normalizedSlug,
-        timezone,
+        timezone: businessTimezone(timezone),
         branding: {
           create: {
             primaryColor: '#0066CC',

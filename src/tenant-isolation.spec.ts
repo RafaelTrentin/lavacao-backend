@@ -32,6 +32,7 @@ import { NotificationsController } from './modules/notifications/notifications.c
 import { NotificationsService } from './modules/notifications/notifications.service';
 import { PushNotificationsController } from './modules/push-notifications/push-notifications.controller';
 import { PushDeviceRevocationController } from './modules/push-notifications/push-device-revocation.controller';
+import { WebPushRevocationController } from './modules/push-notifications/web-push-revocation.controller';
 import { PushNotificationsService } from './modules/push-notifications/push-notifications.service';
 import { FirebaseMessagingService } from './modules/push-notifications/firebase-messaging.service';
 import { ScheduleBlocksController } from './modules/schedule-blocks/schedule-blocks.controller';
@@ -47,9 +48,9 @@ jest.mock('web-push', () => ({ setVapidDetails: jest.fn(), sendNotification: jes
 
 const controllers = [AuthController, AddressesController, AppointmentsController, AvailabilityController,
   BusinessController, PublicBusinessController, CustomersController, DashboardController, ExtraServicesController,
-  MapsController, NotificationsController, PushNotificationsController, PushDeviceRevocationController,
+  MapsController, NotificationsController, PushNotificationsController, PushDeviceRevocationController, WebPushRevocationController,
   ScheduleBlocksController, ServiceModesController, VehicleTypesController];
-const publicControllers = [AuthController, PublicBusinessController, PushDeviceRevocationController];
+const publicControllers = [AuthController, PublicBusinessController, PushDeviceRevocationController, WebPushRevocationController];
 const routes = controllers.flatMap((controller) => Object.getOwnPropertyNames(controller.prototype).flatMap((name) => {
   const handler = controller.prototype[name];
   const method = Reflect.getMetadata(METHOD_METADATA, handler);
@@ -113,6 +114,9 @@ describe('Tenant HTTP boundaries', () => {
   });
   beforeEach(() => {
     jest.clearAllMocks();
+    prisma.$transaction = jest.fn(async (work) => work(prisma));
+    prisma.$queryRaw = jest.fn(async (_sql, businessId) =>
+      rows.business.filter((b) => b.id === businessId && b.isActive && !b.deletedAt).map((b) => ({ id: b.id })));
     rows = Object.fromEntries(models.map((model) => [model, []]));
     rows.business = ['a', 'b'].map((id) => ({ id, slug: `wash-${id}`, isActive: true, deletedAt: null,
       settings: { operatingHours: {} }, businessAddress: { latitude: { toNumber: () => 0 }, longitude: { toNumber: () => 0 } },
@@ -131,6 +135,9 @@ describe('Tenant HTTP boundaries', () => {
       }));
     }
     rows.serviceModeRule = ['a', 'b'].map((id) => ({ id, serviceMode: rows.serviceMode.find((r) => r.id === id), vehicleType: rows.vehicleType.find((r) => r.id === id) }));
+    rows.scheduleBlock.forEach((block) => Object.assign(block, { type: 'TIME_RANGE', isRecurring: false,
+      startAt: new Date('2035-01-08T13:00:00Z'), endAt: new Date('2035-01-08T14:00:00Z'),
+      recurringDays: null, recurringEndDate: null }));
     rows.appointment.forEach((a) => { a.customer = rows.customerProfile.find((c) => c.id === a.customerId); });
     for (const model of models) {
       prisma[model].findUnique.mockImplementation(async ({ where }: any) => rows[model].find((r) => matches(r, where)) || null);
@@ -158,8 +165,8 @@ describe('Tenant HTTP boundaries', () => {
     return { status: response.status, body: await response.json() };
   }
 
-  it('inventories all 81 HTTP handlers and rejects anonymous access to every private handler', async () => {
-    expect(routes).toHaveLength(81);
+  it('inventories all 82 HTTP handlers and rejects anonymous access to every private handler', async () => {
+    expect(routes).toHaveLength(82);
     for (const route of routes.filter((r) => r.private)) {
       expect((await request(route.method, route.path)).status).toBe(401);
     }
@@ -313,7 +320,26 @@ describe('Tenant HTTP boundaries', () => {
     expect(prisma.pushDevice.upsert).not.toHaveBeenCalled();
     expect(JSON.stringify(register.body)).not.toContain('customer-b');
   });
-  it('does not remove another tenant Web Push subscription by endpoint', async () => {
+    it('requires complete Web Push proof and owner for offline revocation without leaking existence', async () => {
+      const endpoint = 'https://push.example.test/web-proof';
+      rows.pushSubscription = [{ endpoint, userId: 'customer-b', businessId: 'b', p256dh: 'fixture-key', auth: 'fixture-secret' }];
+      const proof = { endpoint, userId: 'customer-b', businessId: 'b', keys: { p256dh: 'fixture-key', auth: 'fixture-secret' } };
+      const wrong = await request('POST', '/push-notifications/web/revoke', undefined, { ...proof, keys: { ...proof.keys, auth: 'wrong' } });
+      expect(rows.pushSubscription).toHaveLength(1);
+      const previousOwner = await request('POST', '/push-notifications/web/revoke', undefined, { ...proof, userId: 'customer-a', businessId: 'a' });
+      expect(rows.pushSubscription).toHaveLength(1);
+      const valid = await request('POST', '/push-notifications/web/revoke', undefined, proof);
+      expect(rows.pushSubscription).toHaveLength(0);
+      expect(valid).toEqual(wrong); expect(valid).toEqual(previousOwner);
+      expect(valid).toEqual({ status: 200, body: { success: true } });
+    });
+    it('rejects incomplete proof and unexpected fields on Web Push revocation', async () => {
+      const proof = { endpoint: 'https://push.example.test/web-proof', userId: 'customer-a', businessId: 'a', keys: { p256dh: 'fixture-key', auth: 'fixture-secret' } };
+      expect((await request('POST', '/push-notifications/web/revoke', undefined, { ...proof, keys: {} })).status).toBe(400);
+      expect((await request('POST', '/push-notifications/web/revoke', undefined, { ...proof, token: 'unwanted' })).status).toBe(400);
+      expect(prisma.pushSubscription.deleteMany).not.toHaveBeenCalled();
+    });
+    it('does not remove another tenant Web Push subscription by endpoint', async () => {
     const endpoint = 'https://push.example.test/foreign';
     rows.pushSubscription = [{ endpoint, userId: 'customer-b', businessId: 'b' }];
     expect((await request('DELETE', '/push-notifications/unsubscribe', 'customer-a', { endpoint })).body).toEqual({ count: 0 });
@@ -344,5 +370,41 @@ describe('Tenant HTTP boundaries', () => {
   it('rejects a request for an extra service owned by another company', async () => {
     expect((await request('POST', '/extra-services/requests', 'customer-a', { extraServiceId: 'b' })).status).toBe(400);
     expect(prisma.extraServiceRequest.create).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['PUT', '/admin/service-modes/rules/a', { durationMinutes: 40, basePriceInCents: 1000, businessId: 'b' }],
+    ['PUT', '/admin/service-modes/rules/a', { durationMinutes: -1, basePriceInCents: 1000 }],
+    ['PUT', '/admin/service-modes/rules/a', { durationMinutes: 40.5, basePriceInCents: 1000 }],
+    ['PUT', '/admin/service-modes/rules/a', { durationMinutes: 40, basePriceInCents: -1 }],
+    ['PUT', '/admin/service-modes/rules/a', { durationMinutes: 40, basePriceInCents: 1000, serviceMode: { connect: { id: 'b' } } }],
+    ['PUT', '/extra-services/requests/a/status', { status: 'UNKNOWN' }],
+    ['PUT', '/extra-services/requests/a/status', { status: { set: 'COMPLETED' } }],
+    ['PUT', '/extra-services/requests/a/status', { status: 'COMPLETED', customerId: 'customer-b' }],
+    ['DELETE', '/push-notifications/unsubscribe', { endpoint: { not: null } }],
+    ['DELETE', '/push-notifications/unsubscribe', { endpoint: 'https://push.example.test/a', userId: 'admin-b' }],
+  ])('validates formerly inline DTO: %s %s %j', async (method: string, path: string, body: any) => {
+    expect((await request(method, path, 'admin-a', body)).status).toBe(400);
+    writes().forEach((write) => expect(write).not.toHaveBeenCalled());
+  });
+  it('preserves valid rule and request-status writes and their tenant boundary', async () => {
+    const rule = { durationMinutes: 40, basePriceInCents: 1000 };
+    expect((await request('PUT', '/admin/service-modes/rules/a', 'admin-a', rule)).status).toBe(200);
+    expect((await request('PUT', '/admin/service-modes/rules/b', 'admin-a', rule)).status).toBe(404);
+    expect(rows.serviceModeRule[0]).toMatchObject(rule);
+    expect((await request('PUT', '/extra-services/requests/a/status', 'admin-a', { status: 'COMPLETED' })).status).toBe(200);
+    expect((await request('PUT', '/extra-services/requests/b/status', 'admin-a', { status: 'COMPLETED' })).status).toBe(404);
+    expect(rows.extraServiceRequest[1].status).toBe('CONFIRMED');
+  });
+  it.each([
+    ['PUT', '/business/branding', { primaryColor: '#123456', businessId: 'b' }],
+    ['PUT', '/business/address', { city: 'test', id: 'replacement' }],
+    ['PUT', '/extra-services/a', { name: 'safe', deletedAt: '2035-01-01T00:00:00Z' }],
+    ['POST', '/extra-services/requests', { extraServiceId: 'a', createdAt: '2035-01-01T00:00:00Z' }],
+    ['POST', '/addresses', { streetAddress: 'test', number: '1', neighborhood: 'test', city: 'test', state: 'SC', zipCode: '00000000', customerId: 'customer-b' }],
+  ])('rejects protected fields before mapped writes: %s %s', async (method: string, path: string, body: any) => {
+    expect((await request(method, path, 'customer-a', body)).status).toBe(method === 'PUT' && !path.startsWith('/addresses') ? 403 : 400);
+    // Repeat with an administrator: authorization is not a substitute for DTO validation.
+    expect((await request(method, path, 'admin-a', body)).status).toBe(400);
+    writes().forEach((write) => expect(write).not.toHaveBeenCalled());
   });
 });

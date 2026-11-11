@@ -4,6 +4,9 @@ import {
   IsString,
   ValidateIf,
   IsNumber,
+  IsIn,
+  Min,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
@@ -19,6 +22,7 @@ export class EstimateSearchFeeDto {
 
   @IsOptional()
   @IsString()
+  @IsIn(['CURRENT_LOCATION', 'MANUAL_ADDRESS'])
   searchType?: string;
 
   @ValidateIf((obj) => obj.searchType === 'MANUAL_ADDRESS')
@@ -58,12 +62,14 @@ export class EstimateSearchFeeDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(-90) @Max(90)
   latitude?: number;
 
   @ValidateIf((obj) => obj.searchType === 'CURRENT_LOCATION')
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(-180) @Max(180)
   longitude?: number;
 
   @IsOptional()

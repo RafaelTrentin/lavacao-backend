@@ -1,3 +1,4 @@
+import { UpdateExtraServiceRequestStatusDto } from './dto/update-extra-service-request-status.dto';
 import {
   Controller,
   Get,
@@ -199,7 +200,7 @@ export class ExtraServicesController {
   @UseGuards(AdminGuard)
   async updateRequestStatus(
     @Param('id') requestId: string,
-    @Body() statusData: { status: string },
+    @Body() statusData: UpdateExtraServiceRequestStatusDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
     return this.extraServicesService.updateExtraServiceRequestStatus(

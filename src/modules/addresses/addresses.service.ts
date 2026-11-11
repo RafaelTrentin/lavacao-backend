@@ -15,7 +15,18 @@ export class AddressesService {
       data: {
         businessId,
         customerId,
-        ...createAddressDto,
+        streetAddress: createAddressDto.streetAddress,
+        number: createAddressDto.number,
+        complement: createAddressDto.complement,
+        neighborhood: createAddressDto.neighborhood,
+        city: createAddressDto.city,
+        state: createAddressDto.state,
+        zipCode: createAddressDto.zipCode,
+        latitude: createAddressDto.latitude,
+        longitude: createAddressDto.longitude,
+        addressType: createAddressDto.addressType,
+        isDefault: createAddressDto.isDefault,
+        label: createAddressDto.label,
       },
     });
   }
@@ -50,8 +61,21 @@ export class AddressesService {
     }
 
     return this.prisma.address.update({
-      where: { id: addressId },
-      data: updateData,
+      where: { id: addressId, businessId, customerId, deletedAt: null },
+      data: {
+        streetAddress: updateData.streetAddress,
+        number: updateData.number,
+        complement: updateData.complement,
+        neighborhood: updateData.neighborhood,
+        city: updateData.city,
+        state: updateData.state,
+        zipCode: updateData.zipCode,
+        latitude: updateData.latitude,
+        longitude: updateData.longitude,
+        addressType: updateData.addressType,
+        isDefault: updateData.isDefault,
+        label: updateData.label,
+      },
     });
   }
 
@@ -74,7 +98,7 @@ export class AddressesService {
     }
 
     return this.prisma.address.update({
-      where: { id: addressId },
+      where: { id: addressId, businessId, customerId, deletedAt: null },
       data: { deletedAt: new Date() },
     });
   }

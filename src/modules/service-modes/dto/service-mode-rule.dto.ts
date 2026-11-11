@@ -1,12 +1,12 @@
-import { IsNumber, IsString } from 'class-validator';
+import { IsInt, IsString, Min } from 'class-validator';
 
 export class ServiceModeRuleDto {
   @IsString()
   vehicleTypeKind: string;
 
-  @IsNumber()
+  @IsInt() @Min(1)
   durationMinutes: number;
 
-  @IsNumber()
+  @IsInt() @Min(0)
   basePriceInCents: number;
 }

@@ -1,5 +1,6 @@
 
 import { Module } from '@nestjs/common';
+import { WebPushRevocationController } from './web-push-revocation.controller';
 import { PrismaModule } from '../prisma/prisma.module';
 import { PushNotificationsService } from './push-notifications.service';
 import { PushNotificationsController } from './push-notifications.controller';
@@ -18,6 +19,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
   ]),
 ],
   controllers: [
+    WebPushRevocationController,
     PushNotificationsController,
     PushDeviceRevocationController,
   ],

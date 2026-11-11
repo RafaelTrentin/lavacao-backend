@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { NotificationType } from '@prisma/client';
+import { NotificationType, Prisma } from '@prisma/client';
 
 @Injectable()
 export class NotificationsService {
@@ -13,9 +13,14 @@ export class NotificationsService {
     type: NotificationType;
     title: string;
     message: string;
-  }) {
-    return this.prisma.notification.create({
-      data,
+  }, db: Prisma.TransactionClient = this.prisma) {
+    const recipient = await db.user.findFirst({ where: { id: data.userId, businessId: data.businessId }, select: { id: true } });
+    if (!recipient) throw new NotFoundException('Destinatário não encontrado');
+    return db.notification.create({
+      data: {
+        businessId: data.businessId, userId: data.userId, appointmentId: data.appointmentId,
+        type: data.type, title: data.title, message: data.message,
+      },
     });
   }
 

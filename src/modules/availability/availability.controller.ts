@@ -11,6 +11,7 @@ import {
   CurrentUserPayload,
 } from 'src/common/decorators/current-user.decorator';
 import { AvailabilityService } from './availability.service';
+import { civilDate } from '../../common/business-time';
 import {
   GetAvailableSlotsDto,
   ValidateSlotDto,
@@ -27,7 +28,11 @@ export class AvailabilityController {
     @CurrentUser() user: CurrentUserPayload,
   ) {
     try {
-      const date = this.parseDateOnly(query.date);
+      const date = civilDate(query.date);
+
+      if (query.includeStatus === 'true') {
+        return this.availabilityService.getAvailabilityWithStatus(user.businessId, date, query.vehicleType, query.serviceModeId);
+      }
 
       return this.availabilityService.getAvailableSlots(
         user.businessId,
@@ -49,7 +54,7 @@ export class AvailabilityController {
     @CurrentUser() user: CurrentUserPayload,
   ) {
     try {
-      const date = this.parseDateOnly(query.date);
+      const date = civilDate(query.date);
 
       if (!/^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(query.time)) {
         throw new BadRequestException(
@@ -74,25 +79,4 @@ export class AvailabilityController {
     }
   }
 
-  private parseDateOnly(dateStr: string): Date {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
-
-    if (!match) {
-      throw new BadRequestException(
-        'Data inválida. Use o formato YYYY-MM-DD',
-      );
-    }
-
-    const year = Number(match[1]);
-    const month = Number(match[2]);
-    const day = Number(match[3]);
-
-    const date = new Date(Date.UTC(year, month - 1, day, 12, 0, 0));
-
-    if (isNaN(date.getTime())) {
-      throw new BadRequestException('Data inválida');
-    }
-
-    return date;
-  }
 }

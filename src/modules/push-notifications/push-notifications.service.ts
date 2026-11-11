@@ -86,6 +86,13 @@ export class PushNotificationsService {
     });
   }
 
+  async revokeWebSubscription(data: { endpoint: string; keys: { p256dh: string; auth: string }; userId: string; businessId: string }) {
+    await this.prisma.pushSubscription.deleteMany({ where: {
+      endpoint: data.endpoint, p256dh: data.keys.p256dh, auth: data.keys.auth,
+      userId: data.userId, businessId: data.businessId,
+    } });
+  }
+
   async getPublicKey() {
     return { publicKey: process.env.VAPID_PUBLIC_KEY || '' };
   }
@@ -103,7 +110,7 @@ export class PushNotificationsService {
         isActive: true, deletedAt: null,
         business: { isActive: true, deletedAt: null },
       },
-      select: { id: true },
+      select: { id: true, role: true },
     });
     if (!recipient) return;
 
@@ -126,7 +133,11 @@ export class PushNotificationsService {
     const payload = JSON.stringify({
       title: params.title,
       body: params.body,
-      url: params.url || defaultUrl,
+      // Web routes are server-derived; native URL below remains compatible.
+      url: recipient.role === 'ADMIN' ? '/admin/notifications'
+        : business?.slug ? `/empresa/${encodeURIComponent(business.slug)}/notifications` : '/app',
+      userId: params.userId,
+      businessId: params.businessId,
     });
 
     if (subscriptions.length > 0) {

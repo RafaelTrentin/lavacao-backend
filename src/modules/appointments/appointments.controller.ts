@@ -21,6 +21,7 @@ import { CancelAppointmentDto } from './dto/cancel-appointment.dto';
 import { RescheduleAppointmentDto } from './dto/reschedule-appointment.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { EstimateSearchFeeDto } from './dto/estimate-search-fee.dto';
+import { civilDate, utcInstant } from '../../common/business-time';
 
 @Controller('appointments')
 @UseGuards(JwtGuard)
@@ -137,7 +138,7 @@ export class AppointmentsController {
     @Body() rescheduleDto: RescheduleAppointmentDto,
     @CurrentUser() user: CurrentUserPayload,
   ) {
-    const newScheduledStartAt = new Date(rescheduleDto.newScheduledStartAt);
+    const newScheduledStartAt = utcInstant(rescheduleDto.newScheduledStartAt);
 
     if (isNaN(newScheduledStartAt.getTime())) {
       throw new BadRequestException('Data/hora inválida');
@@ -200,7 +201,7 @@ export class AppointmentsController {
     @Param('date') dateStr: string,
     @CurrentUser() user: CurrentUserPayload,
   ) {
-    const date = this.parseLocalDate(dateStr);
+    const date = civilDate(dateStr);
 
     if (!date) {
       throw new BadRequestException('Data inválida');
@@ -232,19 +233,4 @@ export class AppointmentsController {
     );
   }
 
-  private parseLocalDate(dateStr: string): Date | null {
-    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
-
-    if (!match) return null;
-
-    const year = Number(match[1]);
-    const month = Number(match[2]) - 1;
-    const day = Number(match[3]);
-
-    const date = new Date(year, month, day, 0, 0, 0, 0);
-
-    if (isNaN(date.getTime())) return null;
-
-    return date;
-  }
 }

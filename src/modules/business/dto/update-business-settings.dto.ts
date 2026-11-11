@@ -1,4 +1,4 @@
-import { IsObject, IsNumber, IsOptional, IsString } from 'class-validator';
+import { IsObject, IsNumber, IsOptional, IsString, IsInt, Min } from 'class-validator';
 
 export class UpdateBusinessSettingsDto {
   @IsOptional()
@@ -22,6 +22,7 @@ export class UpdateBusinessSettingsDto {
   whatsappPhone?: string;
 
   @IsOptional()
-  @IsNumber()
+  @IsInt()
+  @Min(0)
   minimumAdvanceMinutes?: number;
 }

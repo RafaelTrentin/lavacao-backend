@@ -5,6 +5,10 @@ import {
   IsOptional,
   ValidateIf,
   IsNumber,
+  Matches,
+  IsEnum,
+  Min,
+  Max,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { SearchType, AddressType } from 'src/common/enums';
@@ -17,6 +21,7 @@ export class CreateAppointmentDto {
   vehicleType: string;
 
   @IsDateString()
+  @Matches(/T.*(?:Z|[+-]\d{2}:\d{2})$/)
   scheduledStartAt: string;
 
   @IsBoolean()
@@ -26,6 +31,7 @@ export class CreateAppointmentDto {
   @IsOptional()
   @Type(() => String)
   @IsString()
+  @IsEnum(SearchType)
   searchType?: SearchType;
 
   @ValidateIf(
@@ -112,6 +118,7 @@ export class CreateAppointmentDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(-90) @Max(90)
   latitude?: number;
 
   @ValidateIf(
@@ -122,6 +129,7 @@ export class CreateAppointmentDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
+  @Min(-180) @Max(180)
   longitude?: number;
 
   @IsOptional()

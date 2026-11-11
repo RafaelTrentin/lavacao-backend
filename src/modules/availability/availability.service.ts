@@ -1,41 +1,24 @@
-import {
-  Injectable,
-  BadRequestException,
-  NotFoundException,
-} from '@nestjs/common';
+import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import {
-  formatInTimeZone,
-  zonedTimeToUtc,
-  utcToZonedTime,
-} from 'date-fns-tz';
+import { addCivilDays, businessTimezone, civilDate, dayBounds, localInstants, localParts, weekday } from '../../common/business-time';
 
-interface TimeBlock {
-  start: Date;
-  end: Date;
-}
-
+interface TimeBlock { start: Date; end: Date }
+interface OperatingPeriod { open: string; close: string }
+interface OperatingHours { [dayName: string]: OperatingPeriod[] | OperatingPeriod | null }
 export interface AvailableSlot {
-  startTime: string;
-  endTime: string;
-  displayLabel: string;
+  startTime: string; endTime: string; displayLabel: string;
+  scheduledStartAt: string; scheduledEndAt: string; timezone: string;
 }
-
-interface OperatingPeriod {
-  open: string;
-  close: string;
-}
-
-interface OperatingHours {
-  [dayName: string]: OperatingPeriod[] | { open: string; close: string } | null;
+interface ValidationOptions {
+  tx?: Prisma.TransactionClient; durationMinutes?: number;
+  excludeAppointmentId?: string; exactStart?: boolean;
 }
 
 @Injectable()
 export class AvailabilityService {
   private readonly EXPLORATION_STEP_MINUTES = 15;
-
   constructor(private prisma: PrismaService) {}
-
   private normalizeDayPeriods(value: any): OperatingPeriod[] {
     if (!value) return [];
 
@@ -62,340 +45,139 @@ export class AvailabilityService {
       .sort((a, b) => a.open.localeCompare(b.open));
   }
 
-  async getAvailableSlots(
-    businessId: string,
-    targetDate: Date,
-    vehicleType: string,
-    serviceModeId: string,
-  ): Promise<AvailableSlot[]> {
-    const business = await this.prisma.business.findUnique({
-      where: { id: businessId },
-      include: { settings: true },
-    });
 
-    if (!business?.settings) {
-      throw new NotFoundException('Configurações de negócio não encontradas');
-    }
-
-    const timezone = business.timezone || 'America/Sao_Paulo';
-    const targetDateInTz = utcToZonedTime(targetDate, timezone);
-
-    const nowInTz = utcToZonedTime(new Date(), timezone);
-    if (this.isDateInPast(targetDateInTz, nowInTz)) {
-      throw new BadRequestException('Data selecionada é do passado');
-    }
-
-    const serviceRule = await this.prisma.serviceModeRule.findFirst({
-      where: {
-        serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
-        vehicleType: { kind: vehicleType, businessId, deletedAt: null },
-      },
-    });
-
-    if (!serviceRule) {
-      throw new BadRequestException(
-        'Modalidade não disponível para este tipo de veículo',
-      );
-    }
-
-    const durationMinutes = serviceRule.durationMinutes;
-
-    const operatingHours = business.settings.operatingHours as OperatingHours;
-    const dayName = this.getDayName(targetDateInTz);
-    const dayPeriods = this.normalizeDayPeriods(operatingHours?.[dayName]);
-
-    if (dayPeriods.length === 0) {
-      return [];
-    }
-
-    const businessPeriods = dayPeriods.map((period) => ({
-      start: this.combineDateTime(targetDateInTz, period.open, timezone),
-      end: this.combineDateTime(targetDateInTz, period.close, timezone),
-    }));
-
-    const minimumAdvanceMinutes =
-      business.settings.minimumAdvanceMinutes || 15;
-    const earliestSlotTime = new Date(
-      nowInTz.getTime() + minimumAdvanceMinutes * 60000,
-    );
-
-    if (businessPeriods.every((period) => earliestSlotTime > period.end)) {
-      return [];
-    }
-
-    const scheduleBlocks = await this.getScheduleBlocksForDate(
-      businessId,
-      targetDateInTz,
-      timezone,
-    );
-
-    const blockTimeBlocks: TimeBlock[] = scheduleBlocks
-      .filter((block) => block.isActive && !block.deletedAt)
-      .map((block) => ({
-        start: block.startAt,
-        end: block.endAt,
-      }));
-
-    const appointments = await this.prisma.appointment.findMany({
-      where: {
-        businessId,
-        status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
-        scheduledStartAt: {
-          gte: this.startOfDay(targetDateInTz, timezone),
-          lt: this.endOfDay(targetDateInTz, timezone),
-        },
-        deletedAt: null,
-      },
-    });
-
-    const appointmentTimeBlocks: TimeBlock[] = appointments.map((apt) => ({
-      start: apt.scheduledStartAt,
-      end: apt.scheduledEndAt,
-    }));
-
-    const allOccupiedBlocks = [...blockTimeBlocks, ...appointmentTimeBlocks];
-    const mergedOccupiedBlocks = this.mergeTimeBlocks(allOccupiedBlocks);
-
-    const allFreeIntervals: TimeBlock[] = [];
-
-    for (const period of businessPeriods) {
-      const freeIntervals = this.calculateFreeIntervals(
-        period.start,
-        period.end,
-        mergedOccupiedBlocks,
-      );
-
-      allFreeIntervals.push(...freeIntervals);
-    }
-
-    const startMarkers = this.extractStartMarkers(
-      allFreeIntervals,
-      durationMinutes,
-    );
-
-    const validSlots: AvailableSlot[] = [];
-
-    for (const marker of startMarkers) {
-      if (marker < earliestSlotTime) {
-        continue;
-      }
-
-      const slotStart = new Date(marker);
-      const slotEnd = new Date(slotStart.getTime() + durationMinutes * 60000);
-
-      const fitsInSomePeriod = businessPeriods.some(
-        (period) => slotStart >= period.start && slotEnd <= period.end,
-      );
-
-      if (!fitsInSomePeriod) {
-        continue;
-      }
-
-      if (!this.isTimeBlockFree(slotStart, slotEnd, mergedOccupiedBlocks)) {
-        continue;
-      }
-
-      validSlots.push({
-        startTime: this.formatTime(slotStart, timezone),
-        endTime: this.formatTime(slotEnd, timezone),
-        displayLabel: `${this.formatTime(slotStart, timezone)} - ${this.formatTime(slotEnd, timezone)}`,
-      });
-    }
-
-    return validSlots;
+  private async context(db: Prisma.TransactionClient, businessId: string, vehicleType: string, serviceModeId: string) {
+    const business = await db.business.findUnique({ where: { id: businessId }, include: { settings: true } });
+    if (!business?.settings) throw new NotFoundException('Configurações de negócio não encontradas');
+    const rule = await db.serviceModeRule.findFirst({ where: {
+      serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
+      vehicleType: { kind: vehicleType, businessId, deletedAt: null },
+    } });
+    if (!rule) throw new BadRequestException('Modalidade não disponível para este tipo de veículo');
+    return { business, rule, zone: businessTimezone(business.timezone) };
   }
 
-  async validateSlotAvailability(
-    businessId: string,
-    targetDate: Date,
-    startTime: string,
-    vehicleType: string,
-    serviceModeId: string,
-  ): Promise<boolean> {
+  private periods(date: string, zone: string, settings: { operatingHours: unknown; nonOperatingDates?: unknown }): TimeBlock[] {
+    if (Array.isArray(settings.nonOperatingDates) && settings.nonOperatingDates.includes(date)) return [];
+    const hours = settings.operatingHours as OperatingHours;
+    return this.normalizeDayPeriods(hours?.[weekday(date)]).flatMap((period) => {
+      const opens = localInstants(date, period.open, zone);
+      const closes = localInstants(date, period.close, zone);
+      // Do not silently shift nonexistent opening/closing times across DST.
+      if (!opens.length || !closes.length) return [];
+      return [{ start: opens[0], end: closes[closes.length - 1] }];
+    });
+  }
+
+  private earliest(settings: { minimumAdvanceMinutes: number }, now: Date): Date {
+    const advance = settings.minimumAdvanceMinutes ?? 15;
+    if (!Number.isInteger(advance) || advance < 0) throw new BadRequestException('Antecedência mínima inválida');
+    return new Date(now.getTime() + advance * 60000);
+  }
+
+  async getAvailableSlots(businessId: string, targetDate: string | Date, vehicleType: string, serviceModeId: string): Promise<AvailableSlot[]> {
+    const { business, rule, zone } = await this.context(this.prisma, businessId, vehicleType, serviceModeId);
+    const date = typeof targetDate === 'string' ? civilDate(targetDate) : localParts(targetDate, zone).date;
+    const now = new Date();
+    if (date < localParts(now, zone).date) throw new BadRequestException('Data selecionada é do passado');
+    if (rule.durationMinutes <= 0) throw new BadRequestException('Duração inválida');
+    const periods = this.periods(date, zone, business.settings);
+    if (!periods.length) return [];
+    const earliest = this.earliest(business.settings, now);
+    const bounds = dayBounds(date, zone);
+    const occupied = await this.occupied(this.prisma, businessId, date, zone, bounds.start, bounds.end);
+    const free = periods.flatMap((period) => this.calculateFreeIntervals(period.start, period.end, occupied));
+    const markers = this.extractStartMarkers(free, rule.durationMinutes);
+    const slots = markers.filter((start) => start >= earliest).map((start) => {
+      const end = new Date(start.getTime() + rule.durationMinutes * 60000);
+      const startTime = localParts(start, zone).time, endTime = localParts(end, zone).time;
+      return { startTime, endTime, displayLabel: startTime + ' - ' + endTime,
+        scheduledStartAt: start.toISOString(), scheduledEndAt: end.toISOString(), timezone: zone };
+    });
+    // Two fall-back occurrences must remain independently selectable.
+    for (const slot of slots) {
+      if (slots.filter((other) => other.startTime === slot.startTime).length > 1) {
+        const offset = new Intl.DateTimeFormat('en', { timeZone: zone, timeZoneName: 'shortOffset' })
+          .formatToParts(new Date(slot.scheduledStartAt)).find((part) => part.type === 'timeZoneName')!.value;
+        slot.displayLabel += ' (' + offset + ')';
+      }
+    }
+    return slots;
+  }
+
+  async getAvailabilityWithStatus(businessId: string, date: string, vehicleType: string, serviceModeId: string) {
+    const slots = await this.getAvailableSlots(businessId, date, vehicleType, serviceModeId);
+    const { business, zone } = await this.context(this.prisma, businessId, vehicleType, serviceModeId);
+    const bounds = dayBounds(civilDate(date), zone);
+    const blocks = await this.prisma.scheduleBlock.findMany({ where: {
+      businessId, deletedAt: null, isActive: true, isRecurring: false,
+      startAt: { lte: bounds.start }, endAt: { gte: new Date(bounds.end.getTime() - 1) },
+    }, select: { id: true } });
+    const closed = blocks.length > 0 || !this.periods(date, zone, business.settings).length;
+    return { slots: closed ? [] : slots, closed,
+      message: closed ? 'A lavação estará fechada nesta data. Escolha outra data.' : null };
+  }
+
+  async validateSlotAvailability(businessId: string, targetDate: string | Date, startTime: string,
+    vehicleType: string, serviceModeId: string, options: ValidationOptions = {}): Promise<boolean> {
+    const db = options.tx ?? this.prisma;
     try {
-      if (!/^([0-1][0-9]|2[0-3]):[0-5][0-9]$/.test(startTime)) {
-        return false;
-      }
-
-      const serviceRule = await this.prisma.serviceModeRule.findFirst({
-        where: {
-          serviceMode: { id: serviceModeId, businessId, isActive: true, deletedAt: null },
-          vehicleType: { kind: vehicleType, businessId, deletedAt: null },
-        },
-      });
-
-      if (!serviceRule) return false;
-
-      const business = await this.prisma.business.findUnique({
-        where: { id: businessId },
-        include: { settings: true },
-      });
-
-      if (!business?.settings) return false;
-
-      const timezone = business.timezone || 'America/Sao_Paulo';
-      const targetDateInTz = utcToZonedTime(targetDate, timezone);
-
-      const slotStart = this.combineDateTime(
-        targetDateInTz,
-        startTime,
-        timezone,
-      );
-      const slotEnd = new Date(
-        slotStart.getTime() + serviceRule.durationMinutes * 60000,
-      );
-
-      const operatingHours = business.settings.operatingHours as OperatingHours;
-      const dayName = this.getDayName(targetDateInTz);
-      const dayPeriods = this.normalizeDayPeriods(operatingHours?.[dayName]);
-
-      if (dayPeriods.length === 0) return false;
-
-      const businessPeriods = dayPeriods.map((period) => ({
-        start: this.combineDateTime(targetDateInTz, period.open, timezone),
-        end: this.combineDateTime(targetDateInTz, period.close, timezone),
-      }));
-
-      const fitsInSomePeriod = businessPeriods.some(
-        (period) => slotStart >= period.start && slotEnd <= period.end,
-      );
-
-      if (!fitsInSomePeriod) {
-        return false;
-      }
-
-      const scheduleBlocks = await this.getScheduleBlocksForDate(
-        businessId,
-        targetDateInTz,
-        timezone,
-      );
-
-      const blockTimeBlocks = scheduleBlocks
-        .filter((block) => block.isActive && !block.deletedAt)
-        .map((block) => ({
-          start: block.startAt,
-          end: block.endAt,
-        }));
-
-      const appointments = await this.prisma.appointment.findMany({
-        where: {
-          businessId,
-          status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
-          scheduledStartAt: {
-            gte: this.startOfDay(targetDateInTz, timezone),
-            lt: this.endOfDay(targetDateInTz, timezone),
-          },
-          deletedAt: null,
-        },
-      });
-
-      const appointmentTimeBlocks: TimeBlock[] = appointments.map((apt) => ({
-        start: apt.scheduledStartAt,
-        end: apt.scheduledEndAt,
-      }));
-
-      const allOccupiedBlocks = [...blockTimeBlocks, ...appointmentTimeBlocks];
-      const mergedOccupiedBlocks = this.mergeTimeBlocks(allOccupiedBlocks);
-
-      return this.isTimeBlockFree(slotStart, slotEnd, mergedOccupiedBlocks);
-    } catch {
+      const { business, rule, zone } = await this.context(db, businessId, vehicleType, serviceModeId);
+      const date = typeof targetDate === 'string' ? civilDate(targetDate) : localParts(targetDate, zone).date;
+      const candidates = options.exactStart && targetDate instanceof Date
+        ? [targetDate] : localInstants(date, startTime, zone);
+      // The legacy date/time-only endpoint cannot disambiguate a repeated hour.
+      if (candidates.length !== 1) return false;
+      const start = candidates[0];
+      const duration = options.durationMinutes ?? rule.durationMinutes;
+      if (!Number.isInteger(duration) || duration <= 0 || !Number.isFinite(start.getTime())) return false;
+      const end = new Date(start.getTime() + duration * 60000);
+      if (start < this.earliest(business.settings, new Date())) return false;
+      if (!this.periods(date, zone, business.settings).some((period) => start >= period.start && end <= period.end)) return false;
+      const occupied = await this.occupied(db, businessId, date, zone, start, end, options.excludeAppointmentId);
+      return this.isTimeBlockFree(start, end, occupied);
+    } catch (error) {
+      if (options.tx) throw error;
       return false;
     }
   }
 
-  private async getScheduleBlocksForDate(
-    businessId: string,
-    targetDate: Date,
-    timezone: string,
-  ) {
-    const dayOfWeek = this.getDayName(targetDate);
-    const startOfDayUTC = this.startOfDay(targetDate, timezone);
-    const endOfDayUTC = this.endOfDay(targetDate, timezone);
-
-    const scheduleBlocks = await this.prisma.scheduleBlock.findMany({
-      where: {
-        businessId,
-        isActive: true,
-        deletedAt: null,
-        OR: [
-          {
-            startAt: { lt: endOfDayUTC },
-            endAt: { gt: startOfDayUTC },
-          },
-          {
-            isRecurring: true,
-          },
-        ],
-      },
-    });
-
-    return scheduleBlocks.filter((block) => {
-      if (!block.isRecurring) {
-        return true;
+  private async occupied(db: Prisma.TransactionClient, businessId: string, date: string, zone: string,
+    start: Date, end: Date, excludeAppointmentId?: string): Promise<TimeBlock[]> {
+    const blocks = await db.scheduleBlock.findMany({ where: { businessId, isActive: true, deletedAt: null,
+      OR: [{ startAt: { lt: end }, endAt: { gt: start } }, { isRecurring: true }] } });
+    const blockIntervals = blocks.flatMap((block): TimeBlock[] => {
+      if (!block.isRecurring) return [{ start: block.startAt, end: block.endAt }];
+      const anchor = localParts(block.startAt, zone);
+      const anchorEnd = localParts(block.endAt, zone);
+      // Legacy date-only metadata is stored as UTC midnight, not a local instant.
+      const lastDate = block.recurringEndDate ? block.recurringEndDate.toISOString().slice(0, 10) : null;
+      const days = Array.isArray(block.recurringDays) ? block.recurringDays : [];
+      const result: TimeBlock[] = [];
+      // Include a recurring interval carried from the preceding civil day.
+      for (const occurrence of [addCivilDays(date, -1), date]) {
+        if (occurrence < anchor.date || (lastDate && occurrence > lastDate) || !days.includes(weekday(occurrence))) continue;
+        if (block.type === 'FULL_DAY') { result.push(dayBounds(occurrence, zone)); continue; }
+        const nextDay = anchorEnd.date > anchor.date;
+        const opens = localInstants(occurrence, anchor.time, zone);
+        const closes = localInstants(nextDay ? addCivilDays(occurrence, 1) : occurrence, anchorEnd.time, zone);
+        if (opens.length && closes.length) {
+          result.push({ start: opens[0], end: closes[closes.length - 1] });
+        } else {
+          // A recurring boundary can become nonexistent on a later DST date.
+          // Fail closed for that day instead of silently dropping the block.
+          result.push(dayBounds(occurrence, zone));
+        }
       }
-
-      if (block.recurringEndDate && block.recurringEndDate < targetDate) {
-        return false;
-      }
-
-      const recurringDays = Array.isArray(block.recurringDays)
-        ? block.recurringDays
-        : [];
-
-      return recurringDays.includes(dayOfWeek);
+      return result;
     });
-  }
-
-  private combineDateTime(
-    date: Date,
-    timeStr: string,
-    timezone: string,
-  ): Date {
-    const [hours, minutes] = timeStr.split(':').map(Number);
-
-    const dateStr = formatInTimeZone(date, timezone, 'yyyy-MM-dd');
-    const datetimeStr = `${dateStr} ${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:00`;
-
-    return zonedTimeToUtc(datetimeStr, timezone);
-  }
-
-  private formatTime(date: Date, timezone: string): string {
-    return formatInTimeZone(date, timezone, 'HH:mm');
-  }
-
-  private startOfDay(date: Date, timezone: string): Date {
-    const local = utcToZonedTime(date, timezone);
-    const result = new Date(local);
-    result.setHours(0, 0, 0, 0);
-    return zonedTimeToUtc(result, timezone);
-  }
-
-  private endOfDay(date: Date, timezone: string): Date {
-    const local = utcToZonedTime(date, timezone);
-    const result = new Date(local);
-    result.setHours(23, 59, 59, 999);
-    return zonedTimeToUtc(result, timezone);
-  }
-
-  private isDateInPast(targetDate: Date, now: Date): boolean {
-    const targetStartOfDay = new Date(targetDate);
-    targetStartOfDay.setHours(0, 0, 0, 0);
-    const nowStartOfDay = new Date(now);
-    nowStartOfDay.setHours(0, 0, 0, 0);
-    return targetStartOfDay < nowStartOfDay;
-  }
-
-  private getDayName(date: Date): string {
-    const days = [
-      'SUNDAY',
-      'MONDAY',
-      'TUESDAY',
-      'WEDNESDAY',
-      'THURSDAY',
-      'FRIDAY',
-      'SATURDAY',
-    ];
-    return days[date.getDay()];
+    const appointments = await db.appointment.findMany({ where: {
+      businessId, status: { in: ['CONFIRMED', 'IN_PROGRESS'] }, deletedAt: null,
+      ...(excludeAppointmentId && { id: { not: excludeAppointmentId } }),
+      scheduledStartAt: { lt: end }, scheduledEndAt: { gt: start },
+    } });
+    return this.mergeTimeBlocks([...blockIntervals,
+      ...appointments.map((apt) => ({ start: apt.scheduledStartAt, end: apt.scheduledEndAt }))]);
   }
 
   private mergeTimeBlocks(blocks: TimeBlock[]): TimeBlock[] {
