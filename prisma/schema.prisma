@@ -20,6 +20,12 @@ enum AppointmentStatus {
   NO_SHOW
 }
 
+enum AppointmentOrigin {
+  APP
+  ADMIN
+  WALK_IN
+}
+
 enum ExtraServiceRequestStatus {
   PENDING
   QUOTED
@@ -86,6 +92,7 @@ model Business {
   notifications        Notification[]
   pushSubscriptions    PushSubscription[]
   pushDevices          PushDevice[]
+  washBoxes            WashBox[]
 
   @@index([isActive])
   @@index([createdAt])
@@ -315,6 +322,14 @@ model ServiceModeRule {
 model Appointment {
   id            String            @id @default(cuid())
   businessId    String
+  boxId         String?
+  snapshotBoxName String?
+  origin AppointmentOrigin?
+  arrivedAt DateTime?
+  startedAt DateTime?
+  vehicleDescription String?
+  operationalRequestKey String?
+  box WashBox? @relation(fields: [boxId, businessId], references: [id, businessId], onDelete: Restrict)
   customerId    String
   serviceModeId String
   vehicleType   String
@@ -377,6 +392,25 @@ model Appointment {
   @@index([vehicleType])
   @@index([createdAt])
   @@index([serviceModeId])
+  @@index([businessId, boxId, scheduledStartAt])
+  @@unique([businessId, operationalRequestKey])
+}
+
+model WashBox {
+  id String @id @default(cuid())
+  businessId String
+  name String
+  isActive Boolean @default(true)
+  // The first configured box accounts for untouched legacy appointments with boxId=null.
+  isLegacyDefault Boolean @default(false)
+  // Empty means all services. Writes validate every ID against this business.
+  serviceModeIds String[] @default([])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  appointments Appointment[]
+  @@unique([id, businessId])
+  @@unique([businessId, name])
 }
 
 model AppointmentStatusHistory {

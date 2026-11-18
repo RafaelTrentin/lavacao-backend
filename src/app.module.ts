@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { WashBoxesModule } from './modules/wash-boxes/wash-boxes.module';
 import { ConfigModule } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -21,6 +22,7 @@ import { PushNotificationsModule } from './modules/push-notifications/push-notif
 
 @Module({
   imports: [
+    WashBoxesModule,
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env',

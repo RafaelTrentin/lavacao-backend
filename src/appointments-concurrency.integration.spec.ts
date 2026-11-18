@@ -4,6 +4,9 @@ import { AvailabilityService } from './modules/availability/availability.service
 import { ScheduleBlocksService } from './modules/schedule-blocks/schedule-blocks.service';
 import { withScheduleTransaction } from './modules/appointments/schedule-transaction';
 import { NotificationsService } from './modules/notifications/notifications.service';
+import { WashBoxesService } from './modules/wash-boxes/wash-boxes.service';
+import { CustomersService } from './modules/customers/customers.service';
+import { randomUUID } from 'node:crypto';
 
 // Never fall back to DATABASE_URL (which may point to production).
 const url = process.env.WASHSYNC_CONCURRENCY_TEST_URL;
@@ -96,6 +99,287 @@ integration('PostgreSQL appointment concurrency', () => {
 
   it('allows at most one of two simultaneous bookings', async () => {
     await expectOne(await Promise.allSettled([create(0), create(1)]));
+  });
+
+  const boxes = () => new WashBoxesService(db as any);
+  describe('Operational panel and walk-ins', () => {
+    beforeEach(async () => {
+      await db.user.update({ where: { id: users[1].id }, data: { role: 'ADMIN' } });
+      jest.useFakeTimers({ now: at(12), doNotFake: ['nextTick', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'performance', 'hrtime', 'queueMicrotask'] });
+    });
+    afterEach(() => jest.useRealTimers());
+    const walkIn = (index = 0, key = randomUUID(), customerId = users[0].customerProfile.id) => services[index].createAppointment(
+      tenant.id, customerId, users[1].id, { serviceModeId: mode.id, vehicleType: 'CAR', scheduledStartAt: at(12).toISOString(), willSearchVehicle: false },
+      { origin: 'WALK_IN', requestKey: key, vehicleDescription: 'Fictício azul' });
+
+    it('reuses quick customers and existing appointments for walk-in, arrival, start and completion', async () => {
+      const customer = await new CustomersService(db as any).createQuickCustomer(tenant.id, { name: 'Cliente fictício', phone: '00000000000' });
+      const apt = await walkIn(0, randomUUID(), customer.id);
+      expect(apt).toMatchObject({ origin: 'WALK_IN', status: 'CONFIRMED', arrivedAt: at(12) });
+      expect(await db.notification.count({ where: { appointmentId: apt.id } })).toBe(0);
+      let board = await services[0].getOperations(tenant.id);
+      expect(board.summary).toMatchObject({ waiting: 1, inProgress: 0, walkIns: 1 });
+      expect(JSON.stringify(board)).not.toMatch(/passwordHash|tokenVersion|operationalRequestKey/);
+      await services[0].startAppointment(apt.id, tenant.id, users[1].id);
+      jest.setSystemTime(at(12, 25));
+      await services[0].completeAppointment(apt.id, tenant.id, users[1].id);
+      board = await services[0].getOperations(tenant.id);
+      expect(board.summary.completed).toBe(1);
+      expect(board.appointments[0]).toMatchObject({ startedAt: at(12), completedAt: at(12, 25), expectedCompletionAt: at(12, 40) });
+      expect(await db.appointmentStatusHistory.count({ where: { appointmentId: apt.id } })).toBe(3);
+    });
+    it('deduplicates concurrent walk-in requests and preserves one history row', async () => {
+      const key = randomUUID();
+      const [a, b] = await Promise.all([walkIn(0, key), walkIn(1, key)]);
+      expect(a.id).toBe(b.id);
+      expect(await db.appointment.count({ where: { businessId: tenant.id } })).toBe(1);
+      expect(await db.appointmentStatusHistory.count({ where: { appointmentId: a.id } })).toBe(1);
+      expect(await db.notification.count({ where: { businessId: tenant.id } })).toBe(0);
+      await expect(walkIn(0, key, users[1].customerProfile.id)).rejects.toMatchObject({ status: 400 });
+    });
+    it('accepts only one concurrent walk-in when one box is free', async () => {
+      const results = await Promise.allSettled([walkIn(0), walkIn(1)]);
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    });
+    it('accepts two concurrent walk-ins only when two boxes support the service', async () => {
+      await boxes().create(tenant.id, { name: 'One' }); await boxes().create(tenant.id, { name: 'Two' });
+      const results = await Promise.all([walkIn(0), walkIn(1)]);
+      expect(new Set(results.map((apt) => apt.boxId)).size).toBe(2);
+      await expect(walkIn()).rejects.toMatchObject({ status: 400 });
+    });
+    it('does not bypass a future reservation, closure or operating hours', async () => {
+      const future = await seed(0, 12);
+      await db.appointment.update({ where: { id: future.id }, data: { scheduledStartAt: at(12, 15), scheduledEndAt: at(12, 55) } });
+      await expect(walkIn()).rejects.toMatchObject({ status: 400 });
+      await services[0].cancelAppointment(future.id, tenant.id, users[1].id, 'ADMIN');
+      const block = await new ScheduleBlocksService(db as any).createScheduleBlock(tenant.id, { type: 'FULL_DAY', blockDate: '2035-01-08' } as any);
+      await expect(walkIn()).rejects.toMatchObject({ status: 400 });
+      await new ScheduleBlocksService(db as any).deleteScheduleBlock(block.id, tenant.id);
+      jest.setSystemTime(at(23));
+      await expect(walkIn()).rejects.toMatchObject({ status: 400 });
+    });
+    it('registers arrival once, preserves waiting across midnight and clears it on reschedule', async () => {
+      const apt = await seed(0, 12);
+      await Promise.all(services.map((service) => service.registerArrival(apt.id, tenant.id, users[1].id)));
+      expect(await db.appointmentStatusHistory.count({ where: { appointmentId: apt.id } })).toBe(1);
+      jest.setSystemTime(new Date('2035-01-09T00:10:00Z'));
+      expect((await services[0].getOperations(tenant.id)).summary.waiting).toBe(1);
+      await services[0].rescheduleAppointment(apt.id, tenant.id, new Date('2035-01-09T08:00:00Z'));
+      expect((await db.appointment.findUnique({ where: { id: apt.id } })).arrivedAt).toBeNull();
+    });
+    it('rejects delayed start that would overlap another reservation on the same box', async () => {
+      const late = await seed(0, 9); await seed(1, 12);
+      await services[0].registerArrival(late.id, tenant.id, users[1].id);
+      await expect(services[0].startAppointment(late.id, tenant.id, users[1].id)).rejects.toMatchObject({ status: 400 });
+      expect((await db.appointment.findUnique({ where: { id: late.id } })).status).toBe('CONFIRMED');
+    });
+    it('keeps overdue in-progress capacity occupied until completion', async () => {
+      const apt = await walkIn(); await services[0].startAppointment(apt.id, tenant.id, users[1].id);
+      jest.setSystemTime(at(13));
+      await expect(walkIn()).rejects.toMatchObject({ status: 400 });
+      expect(await new AvailabilityService(db as any).getAvailableSlots(tenant.id, '2035-01-08', 'CAR', mode.id)).toEqual([]);
+      await services[0].completeAppointment(apt.id, tenant.id, users[1].id);
+      await expect(walkIn()).resolves.toBeDefined();
+    });
+    it('allows administrative cancellation in progress but not a customer cancellation', async () => {
+      const apt = await walkIn(); await services[0].startAppointment(apt.id, tenant.id, users[1].id);
+      await expect(services[0].cancelAppointment(apt.id, tenant.id, users[0].id, 'CUSTOMER')).rejects.toMatchObject({ status: 400 });
+      await services[0].cancelAppointment(apt.id, tenant.id, users[1].id, 'ADMIN');
+      await expect(walkIn()).resolves.toBeDefined();
+      await expect(services[0].completeAppointment(apt.id, tenant.id, users[1].id)).rejects.toMatchObject({ status: 400 });
+    });
+    it('validates no-show transitions without duplicating history or notifications', async () => {
+      const apt = await seed(0, 13);
+      await expect(services[0].markNoShow(apt.id, tenant.id, users[1].id)).rejects.toMatchObject({ status: 400 });
+      jest.setSystemTime(at(14));
+      await Promise.all(services.map((service) => service.markNoShow(apt.id, tenant.id, users[1].id)));
+      expect(await db.appointmentStatusHistory.count({ where: { appointmentId: apt.id } })).toBe(1);
+      expect(await db.notification.count({ where: { appointmentId: apt.id } })).toBe(0);
+      await expect(services[0].registerArrival(apt.id, tenant.id, users[1].id)).rejects.toMatchObject({ status: 400 });
+    });
+    it('rejects inactive customers and cross-tenant operations', async () => {
+      await db.user.update({ where: { id: users[0].id }, data: { isActive: false } });
+      await expect(walkIn()).rejects.toMatchObject({ status: 404 });
+      await db.user.update({ where: { id: users[0].id }, data: { isActive: true } });
+      const apt = await walkIn();
+      const foreign = await db.business.create({ data: { name: 'Other test', slug: `ops-${tenant.id}` } });
+      try {
+        for (const action of ['registerArrival', 'markNoShow', 'startAppointment', 'completeAppointment'] as const) {
+          await expect(services[0][action](apt.id, foreign.id, users[1].id)).rejects.toMatchObject({ status: 404 });
+        }
+        expect((await services[0].getOperations(foreign.id)).appointments).toEqual([]);
+        await expect(services[0].createAppointment(foreign.id, users[0].customerProfile.id, users[1].id,
+          { serviceModeId: mode.id, vehicleType: 'CAR', scheduledStartAt: at(12).toISOString(), willSearchVehicle: false },
+          { origin: 'WALK_IN', requestKey: randomUUID() })).rejects.toMatchObject({ status: 400 });
+      } finally { await db.business.delete({ where: { id: foreign.id } }); }
+    });
+    it('preserves overdue legacy records without blocking new bookings when actual presence was not recorded', async () => {
+      const apt = await seed(0, 9);
+      const legacy = await db.appointment.update({ where: { id: apt.id }, data: { status: 'IN_PROGRESS' } });
+      await expect(walkIn()).resolves.toBeDefined();
+      expect(await db.appointment.findUnique({ where: { id: apt.id } })).toEqual(legacy);
+    });
+    it('prevents disabling the box of an overdue waiting vehicle', async () => {
+      const box = await boxes().create(tenant.id, { name: 'One' });
+      await walkIn(); jest.setSystemTime(at(14));
+      await expect(boxes().update(tenant.id, box.id, { isActive: false } as any)).rejects.toMatchObject({ status: 400 });
+    });
+    it('uses the business date across midnight and keeps ongoing vehicles on the board', async () => {
+      await db.business.update({ where: { id: tenant.id }, data: { timezone: 'America/Sao_Paulo' } });
+      const apt = await walkIn(); await services[0].startAppointment(apt.id, tenant.id, users[1].id);
+      jest.setSystemTime(new Date('2035-01-09T01:00:00Z'));
+      expect((await services[0].getOperations(tenant.id)).date).toBe('2035-01-08');
+      jest.setSystemTime(new Date('2035-01-09T04:00:00Z'));
+      const board = await services[0].getOperations(tenant.id);
+      expect(board.date).toBe('2035-01-09'); expect(board.summary.inProgress).toBe(1);
+    });
+  });
+  it('preserves legacy occupancy without rewriting existing appointments when configuring boxes', async () => {
+    const legacy = await seed(0, 12);
+    const first = await boxes().create(tenant.id, { name: 'Original' });
+    expect(first.isLegacyDefault).toBe(true);
+    expect(await db.appointment.findUnique({ where: { id: legacy.id } })).toEqual(legacy);
+    await expect(create(1)).rejects.toMatchObject({ status: 400 });
+    const second = await boxes().create(tenant.id, { name: 'Second' });
+    expect((await create(1)).boxId).toBe(second.id);
+    await expect(create(0)).rejects.toMatchObject({ status: 400 });
+    await expect(boxes().update(tenant.id, first.id, { isActive: false } as any)).rejects.toMatchObject({ status: 400 });
+  });
+  it('allows exactly two concurrent bookings in two boxes', async () => {
+    await boxes().create(tenant.id, { name: 'One' });
+    await boxes().create(tenant.id, { name: 'Two' });
+    const results = await Promise.allSettled([create(0), create(1), create(0)]);
+    const winners = results.filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled');
+    expect(winners).toHaveLength(2);
+    expect(new Set(winners.map((r) => r.value.boxId)).size).toBe(2);
+    const slots = await new AvailabilityService(db as any).getAvailableSlots(tenant.id, '2035-01-08', 'CAR', mode.id);
+    expect(slots.some((s) => s.startTime === '12:00')).toBe(false);
+    expect(slots.some((s) => s.startTime === '12:40')).toBe(true);
+  });
+  it('does not combine fragments from different boxes to fit a long service', async () => {
+    const first = await boxes().create(tenant.id, { name: 'One' });
+    const second = await boxes().create(tenant.id, { name: 'Two' });
+    const a = await seed(0, 12), b = await seed(1, 13);
+    await db.appointment.update({ where: { id: a.id }, data: { boxId: first.id } });
+    await db.appointment.update({ where: { id: b.id }, data: { boxId: second.id } });
+    await db.serviceModeRule.update({ where: { id: rule.id }, data: { durationMinutes: 120 } });
+    await expect(create(0, at(12, 30))).rejects.toMatchObject({ status: 400 });
+  });
+  it('prefers a compatible specialized box and excludes disabled/incompatible boxes', async () => {
+    const general = await boxes().create(tenant.id, { name: 'General' });
+    const specialized = await boxes().create(tenant.id, { name: 'Specialized', serviceModeIds: [mode.id] });
+    await boxes().create(tenant.id, { name: 'Disabled', isActive: false });
+    expect((await create(0)).boxId).toBe(specialized.id);
+    expect((await create(1)).boxId).toBe(general.id);
+    await expect(create(0)).rejects.toMatchObject({ status: 400 });
+    const otherMode = await db.serviceMode.create({ data: { businessId: tenant.id, name: 'Other' } });
+    await expect(boxes().update(tenant.id, specialized.id, { serviceModeIds: [otherMode.id] } as any)).rejects.toMatchObject({ status: 400 });
+  });
+  it('supports deactivation/reactivation and never falls back to a virtual box when all are disabled', async () => {
+    const box = await boxes().create(tenant.id, { name: 'One' });
+    await boxes().update(tenant.id, box.id, { name: 'Renamed', isActive: false } as any);
+    await expect(create(0)).rejects.toMatchObject({ status: 400 });
+    expect(await new AvailabilityService(db as any).getAvailableSlots(tenant.id, '2035-01-08', 'CAR', mode.id)).toEqual([]);
+    await boxes().update(tenant.id, box.id, { isActive: true } as any);
+    expect((await create(0)).snapshotBoxName).toBe('Renamed');
+  });
+  it('does not use a free box that only accepts another service', async () => {
+    const other = await db.serviceMode.create({ data: { businessId: tenant.id, name: 'Other' } });
+    await boxes().create(tenant.id, { name: 'Restricted', serviceModeIds: [other.id] });
+    await expect(create(0)).rejects.toMatchObject({ status: 400 });
+    expect(await new AvailabilityService(db as any).getAvailableSlots(tenant.id, '2035-01-08', 'CAR', mode.id)).toEqual([]);
+  });
+  it('serializes first-box configuration without increasing legacy capacity accidentally', async () => {
+    const results = await Promise.all([
+      new WashBoxesService(clients[1] as any).create(tenant.id, { name: 'One' }),
+      new WashBoxesService(clients[2] as any).create(tenant.id, { name: 'Two' }),
+    ]);
+    expect(results.filter((box) => box.isLegacyDefault)).toHaveLength(1);
+    expect(await db.washBox.count({ where: { businessId: tenant.id } })).toBe(2);
+  });
+  it('distinguishes repeated DST hours and uses elapsed service duration across the fallback', async () => {
+    await db.business.update({ where: { id: tenant.id }, data: { timezone: 'America/New_York' } });
+    await db.businessSettings.update({ where: { businessId: tenant.id }, data: {
+      operatingHours: { SUNDAY: [{ open: '00:00', close: '04:00' }] },
+    } });
+    await boxes().create(tenant.id, { name: 'One' });
+    await boxes().create(tenant.id, { name: 'Two' });
+    const slots = await new AvailabilityService(db as any).getAvailableSlots(tenant.id, '2035-11-04', 'CAR', mode.id);
+    const repeated = slots.filter((slot) => slot.startTime === '01:30');
+    expect(repeated).toHaveLength(2);
+    expect(repeated[0].scheduledStartAt).not.toBe(repeated[1].scheduledStartAt);
+    const a = await create(0, new Date(repeated[0].scheduledStartAt));
+    await create(1, new Date(repeated[0].scheduledStartAt));
+    await expect(create(0, new Date(repeated[0].scheduledStartAt))).rejects.toMatchObject({ status: 400 });
+    await expect(create(0, new Date(repeated[1].scheduledStartAt))).resolves.toBeDefined();
+    expect(new Date(a.scheduledEndAt).getTime() - new Date(a.scheduledStartAt).getTime()).toBe(40 * 60000);
+  });
+  it('releases cancelled capacity and keeps snapshot duration after rule edits and rescheduling', async () => {
+    await boxes().create(tenant.id, { name: 'One' });
+    const a = await create(0);
+    await db.serviceModeRule.update({ where: { id: rule.id }, data: { durationMinutes: 90 } });
+    await services[0].rescheduleAppointment(a.id, tenant.id, at(14));
+    const moved = await db.appointment.findUnique({ where: { id: a.id } });
+    expect(moved.scheduledEndAt).toEqual(at(14, 40));
+    const b = await create(1);
+    expect((await db.appointment.findUnique({ where: { id: b.id } })).scheduledEndAt).toEqual(at(13, 30));
+    await services[1].cancelAppointment(b.id, tenant.id, users[1].id, 'ADMIN');
+    await expect(create(0)).resolves.toBeDefined();
+  });
+  it('serializes two reschedules disputing the last compatible box', async () => {
+    await boxes().create(tenant.id, { name: 'One' });
+    await boxes().create(tenant.id, { name: 'Two' });
+    await create(0); // occupies one of the two at noon
+    const a = await create(0, at(9)), b = await create(1, at(10));
+    const results = await Promise.allSettled([
+      services[0].rescheduleAppointment(a.id, tenant.id, at(12)),
+      services[1].rescheduleCustomerAppointment(b.id, tenant.id, users[1].customerProfile.id, at(12)),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const noon = await db.appointment.findMany({ where: { businessId: tenant.id, scheduledStartAt: at(12) } });
+    expect(noon).toHaveLength(2);
+    expect(new Set(noon.map((apt) => apt.boxId)).size).toBe(2);
+  });
+  it('serializes box deactivation against new allocation', async () => {
+    const box = await boxes().create(tenant.id, { name: 'One' });
+    const results = await Promise.allSettled([create(0), boxes().update(tenant.id, box.id, { isActive: false } as any)]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+  });
+  it('applies full-day and recurring blocks to every box', async () => {
+    await boxes().create(tenant.id, { name: 'One' });
+    await boxes().create(tenant.id, { name: 'Two' });
+    await new ScheduleBlocksService(db as any).createScheduleBlock(tenant.id, {
+      type: 'TIME_RANGE', blockDate: '2035-01-08', blockStartTime: '11:00', blockEndTime: '14:00',
+      isRecurring: true, recurringDays: ['MONDAY'],
+    } as any);
+    await expect(create(0)).rejects.toMatchObject({ status: 400 });
+    await new ScheduleBlocksService(db as any).createScheduleBlock(tenant.id, { type: 'FULL_DAY', blockDate: '2035-01-09' } as any);
+    await expect(create(1, new Date('2035-01-09T12:00:00Z'))).rejects.toMatchObject({ status: 400 });
+  });
+  it.each(['America/Sao_Paulo', 'Asia/Kathmandu', 'America/New_York'])('allocates boxes using IANA timezone %s', async (timezone) => {
+    await db.business.update({ where: { id: tenant.id }, data: { timezone } });
+    await boxes().create(tenant.id, { name: 'One' });
+    await boxes().create(tenant.id, { name: 'Two' });
+    const availability = new AvailabilityService(db as any);
+    const [slot] = await availability.getAvailableSlots(tenant.id, '2035-01-08', 'CAR', mode.id);
+    const first = await create(0, new Date(slot.scheduledStartAt));
+    const second = await create(1, new Date(slot.scheduledStartAt));
+    expect(first.boxId).not.toBe(second.boxId);
+    await expect(create(0, new Date(slot.scheduledStartAt))).rejects.toMatchObject({ status: 400 });
+  });
+  it('rejects cross-tenant IDs at the service and composite foreign key', async () => {
+    const foreign = await db.business.create({ data: { name: 'Foreign fixture', slug: `foreign-${tenant.id}` } });
+    try {
+      const box = await boxes().create(foreign.id, { name: 'Foreign' });
+      const foreignMode = await db.serviceMode.create({ data: { businessId: foreign.id, name: 'Foreign mode' } });
+      await expect(boxes().create(tenant.id, { name: 'Bad', serviceModeIds: [foreignMode.id] })).rejects.toMatchObject({ status: 400 });
+      await expect(boxes().update(tenant.id, box.id, { name: 'Bad' } as any)).rejects.toMatchObject({ status: 404 });
+      expect(await boxes().list(tenant.id)).toEqual([]);
+      const apt = await seed(0, 12);
+      await expect(db.appointment.update({ where: { id: apt.id }, data: { boxId: box.id } })).rejects.toMatchObject({ code: 'P2003' });
+      // A box in another company does not add capacity to the original company.
+      await expect(create(1)).rejects.toMatchObject({ status: 400 });
+    } finally { await db.business.delete({ where: { id: foreign.id } }); }
   });
   it('preserves Android 1.0.3 fixed -03:00 creation and both reschedules for Sao Paulo', async () => {
     await db.business.update({ where: { id: tenant.id }, data: { timezone: 'America/Sao_Paulo' } });

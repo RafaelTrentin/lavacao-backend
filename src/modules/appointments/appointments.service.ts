@@ -3,7 +3,6 @@ import {
   Injectable,
   BadRequestException,
   NotFoundException,
-  ConflictException,
   Logger,
 } from '@nestjs/common';
 import {
@@ -13,6 +12,7 @@ import {
   NotificationType,
   Notification,
   Appointment,
+  AppointmentOrigin,
 } from '@prisma/client';
 import { withScheduleTransaction } from './schedule-transaction';
 import { searchFeePolicy } from './search-fee-policy';
@@ -82,6 +82,7 @@ export class AppointmentsService {
     customerId: string,
     userId: string,
     createAppointmentDto: CreateAppointmentDto,
+    operational: { origin?: AppointmentOrigin; requestKey?: string; vehicleDescription?: string } = {},
   ) {
     const {
       serviceModeId,
@@ -108,7 +109,7 @@ export class AppointmentsService {
       throw new BadRequestException('Data e hora são obrigatórios');
     }
 
-    const scheduledDate = utcInstant(scheduledStartAt);
+    let scheduledDate = utcInstant(scheduledStartAt);
     if (isNaN(scheduledDate.getTime())) {
       throw new BadRequestException('Data/hora inválida');
     }
@@ -258,7 +259,7 @@ export class AppointmentsService {
     }
 
     const durationMinutes = serviceRule.durationMinutes;
-    const scheduledEndAt = new Date(
+    let scheduledEndAt = new Date(
       scheduledDate.getTime() + durationMinutes * 60000,
     );
 
@@ -269,13 +270,29 @@ export class AppointmentsService {
 
     const { appointment, events } = await withScheduleTransaction(this.prisma, businessId,
       async (tx) => {
+        const walkIn = operational.origin === 'WALK_IN';
+        if (walkIn) {
+          if (!operational.requestKey) throw new BadRequestException('Identificador do atendimento obrigatório');
+          const previous = await tx.appointment.findFirst({ where: { businessId, operationalRequestKey: operational.requestKey },
+            include: { customer: true, serviceRule: { include: { serviceMode: true } } } });
+          if (previous) {
+            if (previous.customerId !== customerId || previous.serviceModeId !== serviceModeId || previous.vehicleType !== vehicleType ||
+              previous.vehicleDescription !== (operational.vehicleDescription || null)) throw new BadRequestException('Identificador já usado para outro atendimento');
+            return { appointment: previous, events: [] as Notification[] };
+          }
+          const customer = await tx.customerProfile.findFirst({ where: { id: customerId, businessId,
+            user: { businessId, isActive: true, deletedAt: null, role: 'CUSTOMER' } }, select: { id: true } });
+          if (!customer) throw new NotFoundException('Cliente não encontrado');
+          scheduledDate = new Date();
+          scheduledEndAt = new Date(scheduledDate.getTime() + durationMinutes * 60000);
+        }
         const isAvailable = await this.availabilityService.validateSlotAvailability(
           businessId,
           scheduledDate,
           '',
           vehicleType,
           serviceModeId,
-          { tx, durationMinutes, exactStart: true },
+          { tx, durationMinutes, exactStart: true, ...(walkIn ? { operationalNow: scheduledDate } : {}) },
         );
 
         if (!isAvailable) {
@@ -285,21 +302,7 @@ export class AppointmentsService {
         }
 
 
-        const conflicting = await tx.appointment.findMany({
-          where: {
-            businessId,
-            status: { in: ['CONFIRMED', 'IN_PROGRESS'] },
-            scheduledStartAt: { lt: scheduledEndAt },
-            scheduledEndAt: { gt: scheduledDate },
-            deletedAt: null,
-          },
-        });
-
-        if (conflicting.length > 0) {
-          throw new ConflictException(
-            'Horário foi reservado por outro cliente. Tente novamente.',
-          );
-        }
+        const allocation = await this.availabilityService.allocateBox(tx, businessId, serviceModeId, scheduledDate, scheduledEndAt);
 
         const newAppointment = await tx.appointment.create({
           data: {
@@ -311,6 +314,11 @@ export class AppointmentsService {
 
             scheduledStartAt: scheduledDate,
             scheduledEndAt,
+            ...allocation,
+            origin: operational.origin ?? 'APP',
+            arrivedAt: walkIn ? scheduledDate : null,
+            vehicleDescription: walkIn ? operational.vehicleDescription || null : null,
+            operationalRequestKey: walkIn ? operational.requestKey : null,
 
             snapshotServiceModeName: serviceMode.name,
             snapshotDurationMinutes: durationMinutes,
@@ -356,11 +364,11 @@ export class AppointmentsService {
             appointmentId: newAppointment.id,
             oldStatus: null,
             newStatus: AppointmentStatus.CONFIRMED,
-            reason: 'Agendamento criado',
+            reason: walkIn ? 'Atendimento presencial registrado; veículo aguardando' : 'Agendamento criado',
           },
         });
 
-        const events = await this.recordAdminNotifications(tx, newAppointment);
+        const events = walkIn ? [] : await this.recordAdminNotifications(tx, newAppointment);
         return { appointment: newAppointment, events };
       },
     );
@@ -392,7 +400,7 @@ export class AppointmentsService {
         }
       }
 
-      if (appointment.status !== AppointmentStatus.CONFIRMED) {
+      if (appointment.status !== AppointmentStatus.CONFIRMED && !(userRole === 'ADMIN' && appointment.status === AppointmentStatus.IN_PROGRESS)) {
         throw new BadRequestException(
           'Apenas agendamentos confirmados podem ser cancelados',
         );
@@ -483,6 +491,8 @@ export class AppointmentsService {
         data: {
           scheduledStartAt: newScheduledStartAt,
           scheduledEndAt: newScheduledEndAt,
+          arrivedAt: null,
+          ...await this.availabilityService.allocateBox(tx, businessId, appointment.serviceModeId, newScheduledStartAt, newScheduledEndAt, appointment.id),
           status: AppointmentStatus.CONFIRMED,
           confirmedAt: new Date(),
           ...(adminId && {
@@ -574,6 +584,8 @@ export class AppointmentsService {
         data: {
           scheduledStartAt: newScheduledStartAt,
           scheduledEndAt: newScheduledEndAt,
+          arrivedAt: null,
+          ...await this.availabilityService.allocateBox(tx, businessId, appointment.serviceModeId, newScheduledStartAt, newScheduledEndAt, appointment.id),
           status: AppointmentStatus.CONFIRMED,
           confirmedAt: new Date(),
         },
@@ -620,10 +632,15 @@ export class AppointmentsService {
       }
 
 
+      const startedAt = new Date();
+      await this.availabilityService.allocateBox(tx, businessId, appointment.serviceModeId, startedAt,
+        new Date(startedAt.getTime() + appointment.snapshotDurationMinutes * 60000), appointment.id, appointment.boxId ?? null);
       const updated = await tx.appointment.update({
         where: { id: appointmentId, businessId, deletedAt: null },
         data: {
           status: AppointmentStatus.IN_PROGRESS,
+          startedAt,
+          arrivedAt: appointment.arrivedAt ?? startedAt,
           modifiedByAdminId: adminId,
           modifiedAt: new Date(),
         },
@@ -728,6 +745,69 @@ async completeAppointment(
     return appointments.map((appointment) => ({ ...appointment, ...searchFeePolicy(appointment) }));
   }
 
+  async registerArrival(id: string, businessId: string, adminId: string) {
+    return withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const apt = await this.getAppointmentById(id, businessId, tx);
+      if (apt.status !== 'CONFIRMED') throw new BadRequestException('Somente um atendimento confirmado pode registrar chegada');
+      if (apt.arrivedAt) return apt;
+      const updated = await tx.appointment.update({ where: { id, businessId }, data: {
+        arrivedAt: new Date(), modifiedAt: new Date(), modifiedByAdminId: adminId,
+      } });
+      await tx.appointmentStatusHistory.create({ data: { appointmentId: id, oldStatus: 'CONFIRMED', newStatus: 'CONFIRMED', reason: 'Chegada registrada; aguardando atendimento' } });
+      return updated;
+    });
+  }
+
+  async markNoShow(id: string, businessId: string, adminId: string) {
+    return withScheduleTransaction(this.prisma, businessId, async (tx) => {
+      const apt = await this.getAppointmentById(id, businessId, tx);
+      if (apt.status === 'NO_SHOW') return apt;
+      if (apt.status !== 'CONFIRMED' || apt.arrivedAt || apt.scheduledStartAt > new Date()) {
+        throw new BadRequestException('Não comparecimento exige horário iniciado e veículo sem chegada registrada');
+      }
+      const updated = await tx.appointment.update({ where: { id, businessId }, data: {
+        status: 'NO_SHOW', modifiedAt: new Date(), modifiedByAdminId: adminId,
+      } });
+      await tx.appointmentStatusHistory.create({ data: { appointmentId: id, oldStatus: 'CONFIRMED', newStatus: 'NO_SHOW', reason: 'Não comparecimento registrado pelo administrador' } });
+      return updated;
+    });
+  }
+
+  async getOperations(businessId: string) {
+    const business = await this.prisma.business.findFirst({ where: { id: businessId, isActive: true, deletedAt: null }, select: { timezone: true } });
+    if (!business) throw new NotFoundException('Empresa não encontrada');
+    const now = new Date(), timezone = businessTimezone(business.timezone);
+    const date = localParts(now, timezone).date, bounds = dayBounds(date, timezone);
+    const appointments = await this.prisma.appointment.findMany({ where: {
+      businessId, deletedAt: null, OR: [
+        { scheduledStartAt: { gte: bounds.start, lt: bounds.end } },
+        { completedAt: { gte: bounds.start, lt: bounds.end } },
+        { status: 'IN_PROGRESS' },
+        { status: 'CONFIRMED', arrivedAt: { not: null } },
+      ],
+    }, orderBy: [{ scheduledStartAt: 'asc' }, { id: 'asc' }], select: {
+      id: true, bookingNumber: true, status: true, origin: true, vehicleType: true, vehicleDescription: true,
+      scheduledStartAt: true, scheduledEndAt: true, arrivedAt: true, startedAt: true, completedAt: true, cancelledAt: true,
+      snapshotDurationMinutes: true, snapshotServiceModeName: true, snapshotTotalPriceInCents: true,
+      boxId: true, snapshotBoxName: true, box: { select: { name: true } },
+      customer: { select: { id: true, name: true } },
+      statusHistory: { orderBy: { changedAt: 'desc' }, take: 10, select: { id: true, oldStatus: true, newStatus: true, reason: true, changedAt: true } },
+    } });
+    const legacy = await this.prisma.washBox.findFirst({ where: { businessId, isLegacyDefault: true }, select: { name: true } });
+    const items = appointments.map((apt) => ({ ...apt,
+      boxName: apt.box?.name ?? apt.snapshotBoxName ?? legacy?.name ?? 'Vaga única',
+      expectedCompletionAt: apt.startedAt ? new Date(apt.startedAt.getTime() + apt.snapshotDurationMinutes * 60000) : apt.scheduledEndAt,
+    }));
+    return { date, timezone, serverNow: now, appointments: items, summary: {
+      scheduled: items.filter((apt) => apt.status === 'CONFIRMED' && !apt.arrivedAt).length,
+      waiting: items.filter((apt) => apt.status === 'CONFIRMED' && apt.arrivedAt).length,
+      inProgress: items.filter((apt) => apt.status === 'IN_PROGRESS').length,
+      completed: items.filter((apt) => apt.status === 'COMPLETED').length,
+      closed: items.filter((apt) => ['CANCELLED', 'NO_SHOW'].includes(apt.status)).length,
+      walkIns: items.filter((apt) => apt.origin === 'WALK_IN').length,
+    } };
+  }
+
   async getAppointmentsByDate(businessId: string, date: string | Date) {
     const business = await this.prisma.business.findUnique({ where: { id: businessId }, select: { timezone: true } });
     if (!business) throw new NotFoundException('Empresa nao encontrada');
@@ -812,6 +892,12 @@ async completeAppointment(
       ...searchFeePolicy(appointment),
       id: appointment.id,
       bookingNumber: appointment.bookingNumber,
+      boxId: appointment.boxId,
+      snapshotBoxName: appointment.snapshotBoxName,
+      origin: appointment.origin,
+      arrivedAt: appointment.arrivedAt,
+      startedAt: appointment.startedAt,
+      vehicleDescription: appointment.vehicleDescription,
       status: appointment.status,
       scheduledStartAt: appointment.scheduledStartAt,
       scheduledEndAt: appointment.scheduledEndAt,

@@ -13,6 +13,8 @@ export interface AvailableSlot {
 interface ValidationOptions {
   tx?: Prisma.TransactionClient; durationMinutes?: number;
   excludeAppointmentId?: string; exactStart?: boolean;
+  // Server-only instant captured after acquiring the schedule lock for a walk-in.
+  operationalNow?: Date;
 }
 
 @Injectable()
@@ -86,7 +88,9 @@ export class AvailabilityService {
     const earliest = this.earliest(business.settings, now);
     const bounds = dayBounds(date, zone);
     const occupied = await this.occupied(this.prisma, businessId, date, zone, bounds.start, bounds.end);
-    const free = periods.flatMap((period) => this.calculateFreeIntervals(period.start, period.end, occupied));
+    const boxes = await this.boxes(this.prisma, businessId, serviceModeId);
+    const free = boxes.flatMap((box) => periods.flatMap((period) =>
+      this.calculateFreeIntervals(period.start, period.end, this.forBox(occupied, box))));
     const markers = this.extractStartMarkers(free, rule.durationMinutes);
     const slots = markers.filter((start) => start >= earliest).map((start) => {
       const end = new Date(start.getTime() + rule.durationMinutes * 60000);
@@ -132,10 +136,12 @@ export class AvailabilityService {
       const duration = options.durationMinutes ?? rule.durationMinutes;
       if (!Number.isInteger(duration) || duration <= 0 || !Number.isFinite(start.getTime())) return false;
       const end = new Date(start.getTime() + duration * 60000);
-      if (start < this.earliest(business.settings, new Date())) return false;
+      if (options.operationalNow ? start.getTime() !== options.operationalNow.getTime()
+        : start < this.earliest(business.settings, new Date())) return false;
       if (!this.periods(date, zone, business.settings).some((period) => start >= period.start && end <= period.end)) return false;
       const occupied = await this.occupied(db, businessId, date, zone, start, end, options.excludeAppointmentId);
-      return this.isTimeBlockFree(start, end, occupied);
+      const boxes = await this.boxes(db, businessId, serviceModeId);
+      return boxes.some((box) => this.isTimeBlockFree(start, end, this.forBox(occupied, box)));
     } catch (error) {
       if (options.tx) throw error;
       return false;
@@ -143,7 +149,7 @@ export class AvailabilityService {
   }
 
   private async occupied(db: Prisma.TransactionClient, businessId: string, date: string, zone: string,
-    start: Date, end: Date, excludeAppointmentId?: string): Promise<TimeBlock[]> {
+    start: Date, end: Date, excludeAppointmentId?: string): Promise<Array<TimeBlock & { boxId?: string | null }>> {
     const blocks = await db.scheduleBlock.findMany({ where: { businessId, isActive: true, deletedAt: null,
       OR: [{ startAt: { lt: end }, endAt: { gt: start } }, { isRecurring: true }] } });
     const blockIntervals = blocks.flatMap((block): TimeBlock[] => {
@@ -174,16 +180,58 @@ export class AvailabilityService {
     const appointments = await db.appointment.findMany({ where: {
       businessId, status: { in: ['CONFIRMED', 'IN_PROGRESS'] }, deletedAt: null,
       ...(excludeAppointmentId && { id: { not: excludeAppointmentId } }),
-      scheduledStartAt: { lt: end }, scheduledEndAt: { gt: start },
+      OR: [
+        { scheduledStartAt: { lt: end }, scheduledEndAt: { gt: start } },
+        { status: 'IN_PROGRESS' }, { arrivedAt: { not: null } },
+      ],
     } });
-    return this.mergeTimeBlocks([...blockIntervals,
-      ...appointments.map((apt) => ({ start: apt.scheduledStartAt, end: apt.scheduledEndAt }))]);
+    return [...blockIntervals,
+      ...appointments.flatMap((apt) => {
+        const scheduled = { start: apt.scheduledStartAt, end: apt.scheduledEndAt, boxId: apt.boxId ?? null };
+        // Legacy records have no actual presence timestamps: preserve their scheduled occupancy.
+        if (!apt.startedAt && !apt.arrivedAt) return [scheduled];
+        const actualStart = apt.startedAt ?? apt.scheduledStartAt;
+        const forecast = apt.startedAt ? new Date(apt.startedAt.getTime() + apt.snapshotDurationMinutes * 60000) : apt.scheduledEndAt;
+        // An overdue vehicle remains on site; do not silently sell its box again.
+        const actualEnd = forecast <= new Date() ? new Date(8640000000000000) : forecast;
+        return [scheduled, { start: actualStart, end: actualEnd, boxId: apt.boxId ?? null }];
+      })];
+  }
+
+  private async boxes(db: Prisma.TransactionClient, businessId: string, serviceModeId: string) {
+    const configured = await db.washBox.findMany({ where: { businessId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] });
+    // No configuration preserves the old single-box behavior, including old rows.
+    if (!configured.length) return [{ id: null as string | null, name: null as string | null, isLegacyDefault: true }];
+    return configured.filter((box) => box.isActive && (!box.serviceModeIds.length || box.serviceModeIds.includes(serviceModeId)));
+  }
+
+  private forBox(occupied: Array<TimeBlock & { boxId?: string | null }>, box: { id: string | null; isLegacyDefault: boolean }) {
+    return this.mergeTimeBlocks(occupied.filter((item) =>
+      item.boxId === undefined || item.boxId === box.id || (item.boxId === null && box.isLegacyDefault)));
+  }
+
+  /** Called only inside withScheduleTransaction, after all time policy validations. */
+  async allocateBox(tx: Prisma.TransactionClient, businessId: string, serviceModeId: string,
+    start: Date, end: Date, excludeAppointmentId?: string, requiredBoxId?: string | null) {
+    const business = await tx.business.findUnique({ where: { id: businessId }, select: { timezone: true } });
+    const zone = businessTimezone(business?.timezone);
+    const occupied = await this.occupied(tx, businessId, localParts(start, zone).date, zone, start, end, excludeAppointmentId);
+    const boxes = await this.boxes(tx, businessId, serviceModeId);
+    // Prefer specialized boxes, keeping unrestricted capacity available to other services.
+    const box = boxes.sort((a, b) => {
+      const size = (item: typeof a) => 'serviceModeIds' in item && item.serviceModeIds.length ? item.serviceModeIds.length : Number.MAX_SAFE_INTEGER;
+      return size(a) - size(b);
+    }).find((candidate) => (requiredBoxId === undefined || (requiredBoxId === null ? candidate.isLegacyDefault : candidate.id === requiredBoxId)) &&
+      this.isTimeBlockFree(start, end, this.forBox(occupied, candidate)));
+    if (!box) throw new BadRequestException('Nenhum box disponível durante todo o serviço. Escolha outro horário.');
+    return { boxId: box.id, snapshotBoxName: box.name };
   }
 
   private mergeTimeBlocks(blocks: TimeBlock[]): TimeBlock[] {
     if (blocks.length === 0) return [];
 
-    const sorted = [...blocks].sort(
+    const sorted = blocks.map((block) => ({ ...block })).sort(
       (a, b) => a.start.getTime() - b.start.getTime(),
     );
 

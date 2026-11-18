@@ -165,8 +165,8 @@ describe('Tenant HTTP boundaries', () => {
     return { status: response.status, body: await response.json() };
   }
 
-  it('inventories all 82 HTTP handlers and rejects anonymous access to every private handler', async () => {
-    expect(routes).toHaveLength(82);
+  it('inventories all 86 HTTP handlers and rejects anonymous access to every private handler', async () => {
+    expect(routes).toHaveLength(86);
     for (const route of routes.filter((r) => r.private)) {
       expect((await request(route.method, route.path)).status).toBe(401);
     }

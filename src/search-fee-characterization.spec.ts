@@ -31,7 +31,7 @@ describe('Pickup fee - manual negotiation outside the app', () => {
     };
     db.$transaction = jest.fn(async (job) => job(db));
     maps = { geocodeAddress: jest.fn(async () => ({ latitude: 0.01, longitude: 0 })) };
-    service = new AppointmentsService(db, { validateSlotAvailability: jest.fn(async () => true) } as any,
+    service = new AppointmentsService(db, { validateSlotAvailability: jest.fn(async () => true), allocateBox: jest.fn(async () => ({ boxId: null, snapshotBoxName: null })) } as any,
       maps, {} as any, {} as any);
   });
   it('GPS creation recalculates price and distance on the server', async () => {

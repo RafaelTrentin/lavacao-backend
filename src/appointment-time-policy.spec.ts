@@ -25,6 +25,7 @@ describe('Server appointment time policy', () => {
       serviceModeId: 'mode', vehicleType: 'CAR', status: 'CONFIRMED', deletedAt: null, snapshotDurationMinutes: 40,
       bookingNumber: 'fixture', scheduledStartAt: new Date('2030-01-09T12:00:00Z') };
     db = {
+      washBox: { findMany: jest.fn(async () => []) },
       $queryRaw: jest.fn(async () => [{ id: 'a' }]),
       business: { findUnique: jest.fn(async () => business) },
       user: { findMany: jest.fn(async () => []) },
@@ -46,7 +47,7 @@ describe('Server appointment time policy', () => {
     };
     // Query doubles validate business rules; concurrency has a separate real-PG suite.
     db.appointment.findMany.mockImplementation(async ({ where }) => occupied.filter((a) =>
-      a.scheduledStartAt < where.scheduledStartAt.lt && a.scheduledEndAt > where.scheduledEndAt.gt));
+      a.scheduledStartAt < where.OR[0].scheduledStartAt.lt && a.scheduledEndAt > where.OR[0].scheduledEndAt.gt));
     db.$transaction = jest.fn(async (work) => work(db));
     availability = new AvailabilityService(db);
     const notify = { createForUser: jest.fn(async (data) => ({ id: 'event', ...data })), sendToUser: jest.fn() };

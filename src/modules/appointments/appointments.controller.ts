@@ -22,6 +22,7 @@ import { RescheduleAppointmentDto } from './dto/reschedule-appointment.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { EstimateSearchFeeDto } from './dto/estimate-search-fee.dto';
 import { civilDate, utcInstant } from '../../common/business-time';
+import { WalkInDto } from './dto/walk-in.dto';
 
 @Controller('appointments')
 @UseGuards(JwtGuard)
@@ -71,7 +72,35 @@ export class AppointmentsController {
       customer.id,
       user.userId,
       createAdminAppointmentDto.appointment,
+      { origin: 'ADMIN' },
     );
+  }
+
+  @Get('admin/operations')
+  @UseGuards(AdminGuard)
+  operations(@CurrentUser() user: CurrentUserPayload) {
+    return this.appointmentsService.getOperations(user.businessId);
+  }
+
+  @Post('admin/walk-in')
+  @UseGuards(AdminGuard)
+  walkIn(@CurrentUser() user: CurrentUserPayload, @Body() dto: WalkInDto) {
+    return this.appointmentsService.createAppointment(user.businessId, dto.customerId, user.userId, {
+      serviceModeId: dto.serviceModeId, vehicleType: dto.vehicleType,
+      scheduledStartAt: new Date().toISOString(), willSearchVehicle: false,
+    }, { origin: 'WALK_IN', requestKey: dto.requestKey, vehicleDescription: dto.vehicleDescription });
+  }
+
+  @Post(':id/arrive')
+  @UseGuards(AdminGuard)
+  arrive(@CurrentUser() user: CurrentUserPayload, @Param('id') id: string) {
+    return this.appointmentsService.registerArrival(id, user.businessId, user.userId);
+  }
+
+  @Post(':id/no-show')
+  @UseGuards(AdminGuard)
+  noShow(@CurrentUser() user: CurrentUserPayload, @Param('id') id: string) {
+    return this.appointmentsService.markNoShow(id, user.businessId, user.userId);
   }
 
   @Get()

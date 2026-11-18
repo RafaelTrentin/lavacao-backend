@@ -1,5 +1,5 @@
 // Creates and removes only this dedicated, disposable LOCAL PostgreSQL container.
-// No .env file is read and no application seed or migration is executed.
+// DATABASE_URL is forcibly overridden; migrations run ONLY in this disposable container.
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 const root = path.resolve(__dirname, '..');
@@ -29,9 +29,12 @@ function run(command, args, options = {}) {
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
     if (!ready) throw new Error('Disposable PostgreSQL did not become ready');
-    const sql = run(process.execPath, ['node_modules/prisma/build/index.js', 'migrate', 'diff',
-      '--from-empty', '--to-schema-datamodel', 'prisma/schema.prisma', '--script']);
-    run('docker', ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', database, '-v', 'ON_ERROR_STOP=1'], { input: sql });
+    const parsed = new URL(env.DATABASE_URL);
+    if (parsed.hostname !== '127.0.0.1' || parsed.port !== '55439' || parsed.pathname !== '/washsync_concurrency_test') {
+      throw new Error('Refusing migrations outside the disposable test database');
+    }
+    console.log('Verified isolated PostgreSQL: 127.0.0.1:55439 / washsync_concurrency_test');
+    run(process.execPath, ['node_modules/prisma/build/index.js', 'migrate', 'deploy'], { stdio: 'inherit' });
     run(process.execPath, ['node_modules/jest/bin/jest.js', '--runInBand', 'appointments-concurrency.integration.spec.ts'], { stdio: 'inherit' });
   } catch (error) {
     console.error(error.message);
